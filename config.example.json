@@ -1,0 +1,7 @@
+{
+  "delay_days": 7,
+  "auto_run_enabled": false,
+  "run_time": "09:00",
+  "nvd_api_key": "",
+  "retention_days": 180
+}

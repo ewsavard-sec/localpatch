@@ -1,8 +1,31 @@
 # LocalPatch
 
+![CI](https://github.com/ewsavard-sec/localpatch/actions/workflows/ci.yml/badge.svg)
+
 A simple local patch manager for Windows: scans installed software, checks
 for new versions, cross-references known CVEs, and can auto-deploy updates
 after a configurable "burn-in" delay.
+
+## What this demonstrates
+
+- **Local software inventory + vulnerability correlation** — scans installed
+  software via `winget` and cross-references each app's installed version
+  against the NVD (National Vulnerability Database) for known CVEs.
+- **Download integrity verification** — every update is independently
+  re-hashed (SHA256 against winget's own manifest) and Authenticode
+  signature-checked before it's ever allowed near an install command; a
+  failed check blocks deployment and is logged to an auditable table, not
+  silently skipped.
+- **Policy-driven automated deployment** — a configurable N-day "burn-in"
+  delay before any update auto-deploys, plus a 6-month retention policy that
+  purges cached installers to bound disk usage.
+- **Scheduled, unattended operation** — runs as a Windows Scheduled Task via
+  `schtasks`, so the whole scan → verify → deploy → purge pipeline can run
+  daily with no user present.
+
+## Screenshots
+
+<!-- TODO: add real screenshots of the GUI here after running it -->
 
 ## Requirements
 
@@ -29,7 +52,14 @@ orange/red if NVD returned HIGH/CRITICAL severity CVEs for that app.
 ```
 python main.py --scan     # scan + update state, no GUI
 python main.py --auto     # scan, then deploy anything past the delay window
+python main.py --purge    # delete cached patches older than retention_days
 ```
+
+### First run
+
+If `config.json` doesn't exist yet, it's bootstrapped automatically from
+`config.example.json` on first launch — `config.json` itself is gitignored
+(it can hold an NVD API key) so it's never committed.
 
 ### Automatic daily runs
 
@@ -53,6 +83,39 @@ new version's detection time — you always get the full burn-in period on
 whatever the current release actually is. Manual "Deploy Selected" in the
 GUI bypasses the delay for anything you pick by hand.
 
+## How patch verification works
+
+Nothing gets installed straight off the network. For every update, `deployer.py`'s
+`winget upgrade` is only called after `patch_store.py` has:
+
+1. Downloaded the installer via `winget download` into `patch_cache/<package>/<version>/`
+2. Independently re-computed its SHA256 and checked it against the hash winget's
+   own manifest declares for that package/version
+3. Run `Get-AuthenticodeSignature` on the file and checked the result is `Valid`
+   (and, if `trusted_publishers` is configured for that package, that the signer
+   matches)
+
+If any check fails, the deployment is **blocked and logged** — not skipped
+silently. Every attempted download (pass or fail) is recorded in the
+`patch_cache` table, and the GUI's Verification column and "View Verification
+Log" dialog surface the full detail (expected vs. actual hash, signer, when it
+was checked). Rows that failed verification are excluded from "Deploy All
+Eligible" and require manual review.
+
+By default `require_valid_signature` is `true`, which blocks unsigned
+installers outright — set it to `false` in `config.json` to downgrade an
+unsigned/untrusted result to a warning instead of a hard block (this reduces
+the security guarantee; some legitimate installers do ship unsigned).
+
+If `winget download` isn't usable on a given machine, verification falls back
+to a weaker `manifest-only` mode that trusts the hash `winget show` reports
+rather than independently re-downloading and re-hashing — this is always
+labeled as such (never presented as a full independent verification).
+
+Cached installers are purged automatically after `retention_days` (default
+180) to bound disk usage — see `patch_store.purge_expired()`, the "Clean Up
+Old Patches Now" Settings button, or `python main.py --purge`.
+
 ## Known limitations (read before relying on this)
 
 - **Only covers apps `winget` knows about.** Software installed outside a
@@ -72,22 +135,30 @@ GUI bypasses the delay for anything you pick by hand.
   for most packages but a few installers still pop a UI regardless — you
   may see stalled auto-deploys for specific apps, in which case deploy
   those manually and check the app's installer.
-- **This hasn't been run on a live Windows machine yet** — it was built
-  and unit-tested for its Windows-independent logic (the SQLite/delay-
-  window code), but the `winget`/`schtasks` integration needs a real test
-  pass on your machine. Good first step: run `python main.py --scan` from
-  a terminal and check the printed counts look right before touching the
-  GUI or the scheduler.
+- **Partially tested against real winget, not yet the full pipeline.**
+  `patch_store.py`'s download/hash/signature verification and the retention
+  purge have been run against a real `winget download` (confirmed the
+  manifest format, the Authenticode output format, and that a corrupted
+  file correctly fails verification) — but `scanner.py`'s live inventory
+  scan, `deployer.py`'s actual `winget upgrade --silent` install, and
+  `scheduler.py`'s `schtasks` registration haven't had a full end-to-end
+  pass yet. Good first step: run `python main.py --scan` from a terminal
+  and check the printed counts look right before touching auto-deploy or
+  the scheduler.
 
 ## Project layout
 
 ```
-main.py          CLI entry point / GUI launcher
-gui.py           Tkinter interface
-scanner.py       winget-based inventory + upgrade detection
-cve_matcher.py   NVD CVE lookup
-state.py         SQLite persistence + delay-window logic
-deployer.py      Runs winget upgrade for a given package
-scheduler.py     Registers/removes the Windows Scheduled Task
-config.json      Settings (delay days, auto-run, NVD key)
+main.py              CLI entry point / GUI launcher
+gui.py               Tkinter interface
+scanner.py           winget-based inventory + upgrade detection
+cve_matcher.py       NVD CVE lookup
+state.py             SQLite persistence + delay-window + patch_cache logic
+patch_store.py       Download, hash/signature verification, retention purge
+deployer.py          Runs winget upgrade for a given package
+scheduler.py         Registers/removes the Windows Scheduled Task
+tests/               pytest suite (delay window, verification, purge)
+.github/workflows/   CI (runs pytest on windows-latest)
+config.example.json  Settings template, tracked in git
+config.json          Your local settings (gitignored, bootstrapped on first run)
 ```

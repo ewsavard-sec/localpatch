@@ -23,6 +23,7 @@ import scheduler
 import patch_store
 
 CONFIG_PATH = Path(__file__).parent / "config.json"
+CONFIG_EXAMPLE_PATH = Path(__file__).parent / "config.example.json"
 
 DEFAULT_CONFIG = {
     "delay_days": 7,
@@ -34,6 +35,8 @@ DEFAULT_CONFIG = {
 
 
 def load_config():
+    if not CONFIG_PATH.exists() and CONFIG_EXAMPLE_PATH.exists():
+        CONFIG_PATH.write_text(CONFIG_EXAMPLE_PATH.read_text())
     if CONFIG_PATH.exists():
         return {**DEFAULT_CONFIG, **json.loads(CONFIG_PATH.read_text())}
     return dict(DEFAULT_CONFIG)
