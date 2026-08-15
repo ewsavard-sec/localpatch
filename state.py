@@ -160,6 +160,14 @@ def get_patch_cache_entries():
         return [dict(r) for r in rows]
 
 
+def delete_patch_cache_entry(package_id, version):
+    with get_conn() as conn:
+        conn.execute(
+            "DELETE FROM patch_cache WHERE package_id = ? AND version = ?",
+            (package_id, version),
+        )
+
+
 def get_eligible_for_autodeploy(delay_days):
     """Apps with a pending available_version whose burn-in period has elapsed."""
     cutoff = time.time() - delay_days * 86400

@@ -23,6 +23,7 @@ DEFAULT_CONFIG = {
     "auto_run_enabled": False,
     "run_time": "09:00",
     "nvd_api_key": "",
+    "retention_days": 180,
 }
 
 
@@ -170,7 +171,7 @@ class LocalPatchApp:
     def on_settings(self):
         win = tk.Toplevel(self.root)
         win.title("Settings")
-        win.geometry("380x260")
+        win.geometry("400x420")
         win.resizable(False, False)
 
         ttk.Label(win, text="Delay before auto-deploying a new version (days):").pack(anchor="w", padx=12, pady=(12, 2))
@@ -188,11 +189,16 @@ class LocalPatchApp:
         key_var = tk.StringVar(value=self.cfg.get("nvd_api_key", ""))
         ttk.Entry(win, textvariable=key_var, width=36, show="*").pack(anchor="w", padx=12)
 
+        ttk.Label(win, text="Keep cached patch downloads for (days):").pack(anchor="w", padx=12, pady=(12, 2))
+        retention_var = tk.IntVar(value=self.cfg.get("retention_days", 180))
+        ttk.Spinbox(win, from_=30, to=730, textvariable=retention_var, width=6).pack(anchor="w", padx=12)
+
         def save_and_close():
             self.cfg["delay_days"] = delay_var.get()
             self.cfg["run_time"] = time_var.get()
             self.cfg["auto_run_enabled"] = auto_var.get()
             self.cfg["nvd_api_key"] = key_var.get()
+            self.cfg["retention_days"] = retention_var.get()
             save_config(self.cfg)
             try:
                 if auto_var.get():
@@ -204,7 +210,19 @@ class LocalPatchApp:
             win.destroy()
             self.refresh_table()
 
-        ttk.Button(win, text="Save", command=save_and_close).pack(pady=8)
+        def cleanup_now():
+            self.cfg["retention_days"] = retention_var.get()
+            summary = patch_store.purge_expired(self.cfg["retention_days"])
+            messagebox.showinfo(
+                "Cleanup complete",
+                f"Purged {summary['count']} cached patch(es), "
+                f"freed {summary['bytes_freed'] / 1024:.1f} KB.",
+            )
+            self.refresh_table()
+
+        ttk.Button(win, text="Clean Up Old Patches Now", command=cleanup_now).pack(anchor="w", padx=12, pady=(16, 4))
+
+        ttk.Button(win, text="Save", command=save_and_close).pack(pady=12)
 
     def on_view_verification_log(self):
         selection = self.tree.selection()

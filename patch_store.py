@@ -30,6 +30,7 @@ so the PowerShell call below does `$_.Status.ToString()`.
 import hashlib
 import json
 import subprocess
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -257,3 +258,57 @@ def _fallback_manifest_only(package_id, version, reason) -> VerificationResult:
         expected_sha256=sha_match, hash_match=True,
         signature_status="NotChecked", verification_mode="manifest-only",
     )
+
+
+def purge_expired(max_age_days=180):
+    """
+    Deletes cached installer files (and their patch_cache rows) older than
+    `max_age_days`. Does NOT touch the `apps` table's version history --
+    only the cached installer files, which is what actually costs disk
+    space.
+
+    A per-file/per-row failure (locked file, already-missing path) is
+    logged and skipped rather than aborting the whole purge run.
+
+    Returns {"count": int, "bytes_freed": int, "purged": [{"package_id",
+    "version", "age_days"}, ...]}.
+    """
+    cutoff = time.time() - max_age_days * 86400
+    purged = []
+    bytes_freed = 0
+
+    for entry in state.get_patch_cache_entries():
+        downloaded_at = entry.get("downloaded_at")
+        if not downloaded_at:
+            continue
+        try:
+            downloaded_ts = time.mktime(time.strptime(downloaded_at, "%Y-%m-%dT%H:%M:%S"))
+        except ValueError:
+            continue
+        if downloaded_ts > cutoff:
+            continue
+
+        age_days = (time.time() - downloaded_ts) / 86400
+        freed = 0
+        file_path = entry.get("file_path")
+        if file_path:
+            p = Path(file_path)
+            try:
+                if p.exists():
+                    freed = p.stat().st_size
+                    p.unlink()
+                if p.parent.exists() and not any(p.parent.iterdir()):
+                    p.parent.rmdir()
+            except OSError as e:
+                print(f"patch_store.purge_expired: couldn't remove {file_path}: {e}")
+
+        state.delete_patch_cache_entry(entry["package_id"], entry["version"])
+        bytes_freed += freed
+        purged.append({
+            "package_id": entry["package_id"], "version": entry["version"],
+            "age_days": round(age_days, 1),
+        })
+        print(f"Purged {entry['package_id']} {entry['version']} "
+              f"(age {age_days:.1f} days, freed {freed} bytes)")
+
+    return {"count": len(purged), "bytes_freed": bytes_freed, "purged": purged}

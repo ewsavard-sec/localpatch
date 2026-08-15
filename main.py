@@ -29,6 +29,7 @@ DEFAULT_CONFIG = {
     "auto_run_enabled": False,
     "run_time": "09:00",
     "nvd_api_key": "",
+    "retention_days": 180,
 }
 
 
@@ -71,6 +72,15 @@ def run_auto(cfg):
         state.mark_deployed(package_id, version, success)
         print(f"  {app['name']}: {'OK' if success else 'FAILED'}")
 
+    run_purge(cfg)
+
+
+def run_purge(cfg):
+    summary = patch_store.purge_expired(cfg.get("retention_days", 180))
+    print(f"Purged {summary['count']} cached patch(es), freed {summary['bytes_freed']} bytes.")
+    for item in summary["purged"]:
+        print(f"  {item['package_id']} {item['version']} (age {item['age_days']} days)")
+
 
 def main():
     parser = argparse.ArgumentParser(description="LocalPatch — local patch manager")
@@ -78,6 +88,7 @@ def main():
     parser.add_argument("--auto", action="store_true", help="Scan + auto-deploy eligible updates")
     parser.add_argument("--setup-schedule", action="store_true")
     parser.add_argument("--remove-schedule", action="store_true")
+    parser.add_argument("--purge", action="store_true", help="Delete cached patches older than retention_days")
     args = parser.parse_args()
 
     cfg = load_config()
@@ -88,6 +99,9 @@ def main():
     elif args.remove_schedule:
         scheduler.disable()
         print("Scheduled task removed.")
+    elif args.purge:
+        state.init_db()
+        run_purge(cfg)
     elif args.scan:
         run_scan(cfg)
     elif args.auto:
