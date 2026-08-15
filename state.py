@@ -28,6 +28,21 @@ CREATE TABLE IF NOT EXISTS apps (
     last_deployed_at TEXT,
     deploy_status TEXT DEFAULT 'idle'  -- idle | deployed | failed
 );
+
+CREATE TABLE IF NOT EXISTS patch_cache (
+    package_id TEXT,
+    version TEXT,
+    file_path TEXT,
+    expected_sha256 TEXT,
+    actual_sha256 TEXT,
+    hash_match INTEGER,
+    signature_status TEXT,      -- e.g. 'Valid', 'NotSigned', 'HashMismatch', 'NotTrusted'
+    signer_subject TEXT,
+    verification_mode TEXT,     -- 'full' | 'manifest-only'
+    verified INTEGER,           -- 1 if all applicable checks passed
+    downloaded_at TEXT,
+    PRIMARY KEY (package_id, version)
+);
 """
 
 
@@ -44,7 +59,7 @@ def get_conn():
 
 def init_db():
     with get_conn() as conn:
-        conn.execute(SCHEMA)
+        conn.executescript(SCHEMA)
 
 
 def upsert_app(package_id, name, source, installed_version, available_version):
@@ -104,6 +119,44 @@ def mark_deployed(package_id, version, success=True):
 def get_all_apps():
     with get_conn() as conn:
         rows = conn.execute("SELECT * FROM apps ORDER BY name COLLATE NOCASE").fetchall()
+        return [dict(r) for r in rows]
+
+
+def record_patch_download(package_id, version, file_path, expected_sha256, actual_sha256,
+                           signature_status, signer_subject, verification_mode, verified):
+    now = time.strftime("%Y-%m-%dT%H:%M:%S")
+    hash_match = 1 if expected_sha256 and actual_sha256 and expected_sha256.lower() == actual_sha256.lower() else 0
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO patch_cache
+               (package_id, version, file_path, expected_sha256, actual_sha256, hash_match,
+                signature_status, signer_subject, verification_mode, verified, downloaded_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(package_id, version) DO UPDATE SET
+                 file_path=excluded.file_path, expected_sha256=excluded.expected_sha256,
+                 actual_sha256=excluded.actual_sha256, hash_match=excluded.hash_match,
+                 signature_status=excluded.signature_status, signer_subject=excluded.signer_subject,
+                 verification_mode=excluded.verification_mode, verified=excluded.verified,
+                 downloaded_at=excluded.downloaded_at""",
+            (package_id, version, file_path, expected_sha256, actual_sha256, hash_match,
+             signature_status, signer_subject, verification_mode, 1 if verified else 0, now),
+        )
+
+
+def is_patch_verified(package_id, version):
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT verified FROM patch_cache WHERE package_id = ? AND version = ?",
+            (package_id, version),
+        ).fetchone()
+        return bool(row and row["verified"])
+
+
+def get_patch_cache_entries():
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM patch_cache ORDER BY downloaded_at DESC"
+        ).fetchall()
         return [dict(r) for r in rows]
 
 

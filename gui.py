@@ -14,6 +14,7 @@ import scanner
 import cve_matcher
 import deployer
 import scheduler
+import patch_store
 
 CONFIG_PATH = Path(__file__).parent / "config.json"
 
@@ -58,16 +59,19 @@ class LocalPatchApp:
         ttk.Button(bar, text="Scan Now", command=self.on_scan).pack(side="left", padx=4)
         ttk.Button(bar, text="Deploy Selected", command=self.on_deploy_selected).pack(side="left", padx=4)
         ttk.Button(bar, text="Deploy All Eligible", command=self.on_deploy_eligible).pack(side="left", padx=4)
+        ttk.Button(bar, text="View Verification Log", command=self.on_view_verification_log).pack(side="left", padx=4)
         ttk.Button(bar, text="Settings", command=self.on_settings).pack(side="right", padx=4)
 
     def _build_table(self):
-        columns = ("name", "installed", "available", "days_left", "cves", "status")
+        columns = ("name", "installed", "available", "days_left", "cves", "verification", "status")
         self.tree = ttk.Treeview(self.root, columns=columns, show="headings", selectmode="extended")
         headings = {
             "name": "Application", "installed": "Installed", "available": "Available",
-            "days_left": "Days Until Auto-Deploy", "cves": "Known CVEs", "status": "Status",
+            "days_left": "Days Until Auto-Deploy", "cves": "Known CVEs",
+            "verification": "Verification", "status": "Status",
         }
-        widths = {"name": 260, "installed": 110, "available": 110, "days_left": 160, "cves": 220, "status": 90}
+        widths = {"name": 220, "installed": 100, "available": 100, "days_left": 150,
+                  "cves": 180, "verification": 160, "status": 80}
         for col in columns:
             self.tree.heading(col, text=headings[col])
             self.tree.column(col, width=widths[col], anchor="w")
@@ -76,6 +80,7 @@ class LocalPatchApp:
         self.tree.tag_configure("critical", background="#fdecea")
         self.tree.tag_configure("high", background="#fff3e0")
         self.tree.tag_configure("clean", background="#ffffff")
+        self.tree.tag_configure("verify_failed", foreground="#b00020", font=("Segoe UI", 9, "bold"))
 
     def _build_statusbar(self):
         self.status_var = tk.StringVar(value="Ready.")
@@ -114,7 +119,26 @@ class LocalPatchApp:
         if not eligible:
             messagebox.showinfo("LocalPatch", "No apps are past their delay window yet.")
             return
-        self._deploy_many([a["package_id"] for a in eligible])
+
+        cache = {(e["package_id"], e["version"]): e for e in state.get_patch_cache_entries()}
+        deployable, blocked = [], []
+        for app in eligible:
+            entry = cache.get((app["package_id"], app["available_version"]))
+            if entry and not entry["verified"]:
+                blocked.append(app["name"])
+            else:
+                deployable.append(app["package_id"])
+
+        if blocked:
+            messagebox.showwarning(
+                "Some updates excluded",
+                "These apps previously failed verification and are excluded from "
+                "Deploy All Eligible — review them individually via View Verification Log:\n\n"
+                + "\n".join(blocked),
+            )
+        if not deployable:
+            return
+        self._deploy_many(deployable)
 
     def _deploy_many(self, iids):
         iids = list(iids)
@@ -127,11 +151,20 @@ class LocalPatchApp:
 
     def _deploy_worker(self, package_ids):
         apps_by_id = {a["package_id"]: a for a in state.get_all_apps()}
+        blocked = 0
         for pkg_id in package_ids:
-            success, log = deployer.deploy(pkg_id)
             version = apps_by_id.get(pkg_id, {}).get("available_version", "unknown")
+            result = patch_store.verify_and_record(pkg_id, version, self.cfg)
+            if not result.verified:
+                state.mark_deployed(pkg_id, version, success=False)
+                blocked += 1
+                continue
+            success, log = deployer.deploy(pkg_id)
             state.mark_deployed(pkg_id, version, success)
-        self.root.after(0, lambda: self.status_var.set("Deployment finished."))
+        summary = "Deployment finished."
+        if blocked:
+            summary += f" {blocked} blocked by verification — see Verification column."
+        self.root.after(0, lambda: self.status_var.set(summary))
         self.root.after(0, self.refresh_table)
 
     def on_settings(self):
@@ -173,10 +206,66 @@ class LocalPatchApp:
 
         ttk.Button(win, text="Save", command=save_and_close).pack(pady=8)
 
+    def on_view_verification_log(self):
+        selection = self.tree.selection()
+        if not selection:
+            messagebox.showinfo("LocalPatch", "Select an app first.")
+            return
+        pkg_id = selection[0]
+        app = next((a for a in state.get_all_apps() if a["package_id"] == pkg_id), None)
+        if not app:
+            return
+        entry = self._verification_cache.get((pkg_id, app["available_version"]))
+
+        win = tk.Toplevel(self.root)
+        win.title(f"Verification Log — {app['name']}")
+        win.geometry("480x380")
+        win.resizable(False, False)
+
+        frame = ttk.Frame(win, padding=16)
+        frame.pack(fill="both", expand=True)
+
+        if entry is None:
+            ttk.Label(frame, text="No verification has been attempted for this version yet.",
+                      wraplength=440).pack(anchor="w")
+            return
+
+        rows = [
+            ("Package", pkg_id),
+            ("Version", entry["version"]),
+            ("Result", "Verified" if entry["verified"] else "Failed"),
+            ("Verification mode", entry["verification_mode"]),
+            ("Expected SHA256", entry["expected_sha256"] or "-"),
+            ("Actual SHA256", entry["actual_sha256"] or "-"),
+            ("Hash match", "Yes" if entry["hash_match"] else "No"),
+            ("Signature status", entry["signature_status"] or "-"),
+            ("Signer subject", entry["signer_subject"] or "(none)"),
+            ("Checked at", entry["downloaded_at"]),
+            ("File path", entry["file_path"] or "-"),
+        ]
+        for i, (label, value) in enumerate(rows):
+            ttk.Label(frame, text=f"{label}:", font=("Segoe UI", 9, "bold")).grid(
+                row=i, column=0, sticky="ne", pady=2)
+            ttk.Label(frame, text=str(value), wraplength=320, justify="left").grid(
+                row=i, column=1, sticky="w", padx=(8, 0), pady=2)
+
     # ---------- Rendering ----------
+
+    @staticmethod
+    def _verification_label(entry):
+        """Returns (label, is_failed) for the Verification column."""
+        if entry is None:
+            return "Not checked yet", False
+        if entry["verified"]:
+            return "Verified", False
+        if not entry["hash_match"]:
+            return "Failed — hash mismatch", True
+        return "Failed — unsigned", True
 
     def refresh_table(self):
         self.tree.delete(*self.tree.get_children())
+        self._verification_cache = {(e["package_id"], e["version"]): e for e in state.get_patch_cache_entries()}
+
         for app in state.get_all_apps():
             if not app["available_version"] or app["available_version"] == app["installed_version"]:
                 continue  # only show apps with a pending update
@@ -184,18 +273,22 @@ class LocalPatchApp:
             cves = json.loads(app["cves"] or "[]")
             cve_text = ", ".join(c["id"] for c in cves) if cves else "-"
             severities = [c["severity"] for c in cves]
-            tag = "clean"
+            sev_tag = "clean"
             if "CRITICAL" in severities:
-                tag = "critical"
+                sev_tag = "critical"
             elif "HIGH" in severities:
-                tag = "high"
+                sev_tag = "high"
+
+            entry = self._verification_cache.get((app["package_id"], app["available_version"]))
+            verification_label, verify_failed = self._verification_label(entry)
 
             days_left = self._days_left(app)
             status = app["deploy_status"]
 
-            self.tree.insert("", "end", iid=app["package_id"], tags=(tag,), values=(
+            tags = (("verify_failed",) if verify_failed else ()) + (sev_tag,)
+            self.tree.insert("", "end", iid=app["package_id"], tags=tags, values=(
                 app["name"], app["installed_version"], app["available_version"],
-                days_left, cve_text, status,
+                days_left, cve_text, verification_label, status,
             ))
 
     def _days_left(self, app):

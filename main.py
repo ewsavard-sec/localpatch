@@ -20,6 +20,7 @@ import scanner
 import cve_matcher
 import deployer
 import scheduler
+import patch_store
 
 CONFIG_PATH = Path(__file__).parent / "config.json"
 
@@ -60,8 +61,14 @@ def run_auto(cfg):
     eligible = state.get_eligible_for_autodeploy(cfg["delay_days"])
     print(f"{len(eligible)} update(s) past the {cfg['delay_days']}-day delay window.")
     for app in eligible:
-        success, log = deployer.deploy(app["package_id"])
-        state.mark_deployed(app["package_id"], app["available_version"], success)
+        package_id, version = app["package_id"], app["available_version"]
+        result = patch_store.verify_and_record(package_id, version, cfg)
+        if not result.verified:
+            state.mark_deployed(package_id, version, success=False)
+            print(f"  {app['name']}: BLOCKED — failed verification ({result.reason})")
+            continue
+        success, log = deployer.deploy(package_id)
+        state.mark_deployed(package_id, version, success)
         print(f"  {app['name']}: {'OK' if success else 'FAILED'}")
 
 
