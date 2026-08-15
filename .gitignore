@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+localpatch.db
+patch_cache/
+config.json
+.venv/
+venv/
