@@ -52,9 +52,11 @@ def run_scan(cfg):
 
     for pkg_id, app in installed.items():
         available = upgrades.get(pkg_id, {}).get("Available")
+        release_date = scanner.get_release_date(pkg_id, available) if available else None
         state.upsert_app(
             package_id=pkg_id, name=app["Name"], source=app.get("Source", ""),
             installed_version=app["Version"], available_version=available,
+            release_date=release_date,
         )
         cves = matcher.lookup(app["Name"], app["Version"])
         state.set_cves(pkg_id, cves)

@@ -543,9 +543,11 @@ class LocalPatchApp:
                     break
 
                 available = upgrades.get(pkg_id, {}).get("Available")
+                release_date = scanner.get_release_date(pkg_id, available) if available else None
                 state.upsert_app(
                     package_id=pkg_id, name=app["Name"], source=app.get("Source", ""),
                     installed_version=app["Version"], available_version=available,
+                    release_date=release_date,
                 )
                 cves = matcher.lookup(app["Name"], app["Version"])
                 state.set_cves(pkg_id, cves)
@@ -1005,10 +1007,17 @@ class LocalPatchApp:
         self.refresh_dashboard()
 
     def _days_left(self, app):
-        if not app["first_seen_available"]:
+        # Same anchor preference as state.get_eligible_for_autodeploy():
+        # release_date when winget reports one, otherwise local detection
+        # time -- so this column always matches what actually gates
+        # Deploy All Eligible instead of showing a different countdown.
+        anchor = app["release_date"] or app["first_seen_available"]
+        if not anchor:
             return "-"
-        first_seen_ts = time.mktime(time.strptime(app["first_seen_available"], "%Y-%m-%dT%H:%M:%S"))
-        elapsed_days = (time.time() - first_seen_ts) / 86400
+        anchor_ts = state.parse_anchor_timestamp(anchor)
+        if anchor_ts is None:
+            return "-"
+        elapsed_days = (time.time() - anchor_ts) / 86400
         remaining = self.cfg["delay_days"] - elapsed_days
         return "Eligible now" if remaining <= 0 else f"{remaining:.1f}"
 

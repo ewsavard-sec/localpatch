@@ -75,13 +75,23 @@ python main.py --remove-schedule
 
 ## How the delay window works
 
-Each app's row stores `first_seen_available` — the timestamp the *current*
-available version was first detected. An app only becomes eligible for
-auto-deploy once `now - first_seen_available >= delay_days`. If a second
-new version is released before the delay elapses, the timer resets to the
-new version's detection time — you always get the full burn-in period on
-whatever the current release actually is. Manual "Deploy Selected" in the
-GUI bypasses the delay for anything you pick by hand.
+The burn-in delay is anchored to when a patch **actually shipped**, not
+when this machine happened to notice it. Each scan looks up the release
+date winget's manifest reports for the available version (`winget show`)
+and stores it as `release_date`; an app becomes eligible once
+`now - release_date >= delay_days`. If winget doesn't report a release
+date for a package, it falls back to `first_seen_available` — the
+timestamp this machine first detected the update, the old behavior.
+`release_date` has day-only granularity (no time-of-day), so the
+countdown can be off by up to ~1 day depending what time you're looking
+at it.
+
+If a second new version is released before the delay elapses, the timer
+resets to the new version's release date — you always get the full
+burn-in period on whatever the current release actually is. Manual
+"Deploy Selected" and the "Deploy All Shown" button both bypass the delay
+for apps you pick (or everything currently shown) by hand; only "Deploy
+All Eligible" respects it.
 
 ## How patch verification works
 

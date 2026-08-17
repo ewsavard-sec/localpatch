@@ -63,3 +63,28 @@ def scan_upgrades():
     """Apps with a newer version available, per winget's configured sources."""
     output = _run_winget(["upgrade", "--include-unknown"])
     return _parse_table(output)
+
+
+def get_release_date(package_id, version):
+    """
+    Returns the release date winget's manifest reports for a specific
+    package+version (as the raw string winget prints, typically
+    YYYY-MM-DD), or None if winget doesn't report one for this package
+    or the lookup fails. Used to anchor the auto-deploy delay window to
+    when a patch actually shipped rather than when this machine happened
+    to notice it.
+
+    Confirmed via `winget show --id <id> --version <version>`: the field
+    appears as `Release Date: <date>` indented under the `Installer:`
+    section of the human-readable output -- there's no structured/JSON
+    output mode for `winget show`, so this is line parsing, same as the
+    rest of this module. If a package lists multiple installers (e.g.
+    different architectures) with different release dates, this returns
+    whichever appears first in the output.
+    """
+    output = _run_winget(["show", "--id", package_id, "--version", version])
+    for line in output.splitlines():
+        stripped = line.strip()
+        if stripped.lower().startswith("release date:"):
+            return stripped.split(":", 1)[-1].strip()
+    return None

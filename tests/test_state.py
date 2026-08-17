@@ -33,6 +33,11 @@ def _iso(days_ago):
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(time.time() - days_ago * 86400))
 
 
+def _date_only(days_ago):
+    """Bare YYYY-MM-DD, matching the format winget reports for release_date."""
+    return time.strftime("%Y-%m-%d", time.localtime(time.time() - days_ago * 86400))
+
+
 # ---------- delay window (get_eligible_for_autodeploy) ----------
 
 def test_delay_window_eligible_after_delay(isolated_env):
@@ -59,6 +64,45 @@ def test_delay_window_skips_already_deployed_version(isolated_env):
     state.mark_deployed("pkg.c", "2.0", success=True)
 
     assert state.get_eligible_for_autodeploy(delay_days=7) == []
+
+
+def test_delay_window_prefers_release_date_when_present(isolated_env):
+    # Released 10 days ago (per winget), but this machine only scanned it
+    # moments ago -- first_seen_available alone would say "not eligible yet"
+    # (0 days old), but release_date should govern and make it eligible.
+    state.upsert_app("pkg.d", "Pkg D", "winget", "1.0", "2.0", release_date=_date_only(10))
+
+    eligible = state.get_eligible_for_autodeploy(delay_days=7)
+    assert [a["package_id"] for a in eligible] == ["pkg.d"]
+
+
+def test_delay_window_release_date_can_be_stricter_than_first_seen(isolated_env):
+    # release_date says released 2 days ago (not yet eligible) even though
+    # first_seen_available (backdated here to simulate a stale prior scan)
+    # would say 10 days -- release_date must override, not just OR with it.
+    state.upsert_app("pkg.e", "Pkg E", "winget", "1.0", "2.0", release_date=_date_only(2))
+    with state.get_conn() as conn:
+        conn.execute("UPDATE apps SET first_seen_available = ? WHERE package_id = ?", (_iso(10), "pkg.e"))
+
+    assert state.get_eligible_for_autodeploy(delay_days=7) == []
+
+
+def test_delay_window_falls_back_to_first_seen_without_release_date(isolated_env):
+    # No release_date at all (winget didn't report one) -- falls back to
+    # local detection time, the pre-existing behavior.
+    state.upsert_app("pkg.f", "Pkg F", "winget", "1.0", "2.0")
+    with state.get_conn() as conn:
+        conn.execute("UPDATE apps SET first_seen_available = ? WHERE package_id = ?", (_iso(10), "pkg.f"))
+
+    eligible = state.get_eligible_for_autodeploy(delay_days=7)
+    assert [a["package_id"] for a in eligible] == ["pkg.f"]
+
+
+def test_parse_anchor_timestamp():
+    assert state.parse_anchor_timestamp("2026-01-15") is not None
+    assert state.parse_anchor_timestamp("2026-01-15T09:30:00") is not None
+    assert state.parse_anchor_timestamp("not a date") is None
+    assert state.parse_anchor_timestamp("") is None
 
 
 # ---------- patch_store verification (mocked winget calls) ----------
