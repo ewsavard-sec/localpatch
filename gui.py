@@ -329,6 +329,10 @@ class LocalPatchApp:
                 remaining = (elapsed / i) * (total - i)  # adapts to observed per-app rate
                 self.root.after(0, lambda i=i, name=app["Name"], remaining=remaining:
                                  self._update_scan_progress(i, total, name, remaining))
+                # Populate the table with this app immediately rather than
+                # waiting for the whole scan to finish -- refresh_table()
+                # preserves selection/scroll so this doesn't feel janky.
+                self.root.after(0, self.refresh_table)
 
             if cancelled:
                 app_log.warning(f"Scan stopped by user after {checked}/{total} apps.")
@@ -597,6 +601,13 @@ class LocalPatchApp:
         return "Failed — unsigned", True
 
     def refresh_table(self):
+        # Called repeatedly during a live scan (once per app), not just
+        # once at the end -- preserve selection/scroll position across
+        # rebuilds so the table doesn't jump around under the user while
+        # a scan is still running.
+        selected = self.tree.selection()
+        scroll_pos = self.tree.yview()
+
         self.tree.delete(*self.tree.get_children())
         self._verification_cache = {(e["package_id"], e["version"]): e for e in state.get_patch_cache_entries()}
 
@@ -624,6 +635,11 @@ class LocalPatchApp:
                 app["name"], app["installed_version"], app["available_version"],
                 days_left, cve_text, verification_label, status,
             ))
+
+        for iid in selected:
+            if self.tree.exists(iid):
+                self.tree.selection_add(iid)
+        self.tree.yview_moveto(scroll_pos[0])
 
     def _days_left(self, app):
         if not app["first_seen_available"]:
