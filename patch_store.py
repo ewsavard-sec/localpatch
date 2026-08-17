@@ -51,6 +51,7 @@ class VerificationResult:
     hash_match: bool = False
     signature_status: str = "NotChecked"
     signer_subject: str | None = None
+    signature_message: str | None = None
     verification_mode: str = "full"
     extra: dict = field(default_factory=dict)
 
@@ -118,10 +119,17 @@ def _expected_hash_from_manifest(manifest_path: Path, actual_sha256: str):
 
 
 def _check_signature(file_path: Path, trusted_publishers=None):
-    """Runs Get-AuthenticodeSignature and returns (status, signer_subject)."""
+    """
+    Runs Get-AuthenticodeSignature and returns (status, signer_subject,
+    status_message). `status_message` is PowerShell's own human-readable
+    explanation (e.g. "The file ... is not digitally signed.") -- this is
+    the closest thing Get-AuthenticodeSignature offers to an "error code":
+    the Status enum value IS the classification (NotSigned, HashMismatch,
+    NotTrusted, etc.), and StatusMessage is its explanation.
+    """
     ps_cmd = (
         f"Get-AuthenticodeSignature -FilePath '{file_path}' | "
-        "Select-Object @{N='Status';E={$_.Status.ToString()}}, "
+        "Select-Object @{N='Status';E={$_.Status.ToString()}}, StatusMessage, "
         "@{N='SignerSubject';E={$_.SignerCertificate.Subject}} | "
         "ConvertTo-Json -Compress"
     )
@@ -132,16 +140,21 @@ def _check_signature(file_path: Path, trusted_publishers=None):
     try:
         data = json.loads(result.stdout.strip())
     except (ValueError, json.JSONDecodeError):
-        return "UnknownError", None
+        detail = (result.stderr or result.stdout or "").strip()[-300:]
+        message = f"powershell call failed: {detail}" if detail else "powershell call produced no parseable output"
+        return "UnknownError", None, message
 
     status = data.get("Status", "UnknownError")
     signer_subject = data.get("SignerSubject")
+    status_message = data.get("StatusMessage")
 
     if status == "Valid" and trusted_publishers:
         if not signer_subject or not any(pub in signer_subject for pub in trusted_publishers):
-            return "NotTrusted", signer_subject
+            return "NotTrusted", signer_subject, (
+                f"signer '{signer_subject or '(none)'}' is not in the configured trusted_publishers list"
+            )
 
-    return status, signer_subject
+    return status, signer_subject, status_message
 
 
 def download_and_verify(package_id, version, config=None) -> VerificationResult:
@@ -183,18 +196,21 @@ def download_and_verify(package_id, version, config=None) -> VerificationResult:
             hash_match=False, verification_mode="full",
         )
 
-    signature_status, signer_subject = _check_signature(installer_path, trusted_publishers)
+    signature_status, signer_subject, signature_message = _check_signature(installer_path, trusted_publishers)
     signature_ok = signature_status == "Valid"
 
     if not hash_match:
-        reason = "hash mismatch"
+        reason = (f"hash mismatch: expected {expected_sha256}, "
+                   f"got {actual_sha256} -- downloaded file does not match winget's manifest")
         verified = False
     elif not signature_ok and require_valid_signature:
-        reason = f"signature check failed ({signature_status})"
+        detail = f" -- {signature_message}" if signature_message else ""
+        reason = f"signature check failed ({signature_status}){detail}"
         verified = False
     else:
         if not signature_ok:
-            reason = f"verified (signature advisory-only, status={signature_status})"
+            detail = f" ({signature_message})" if signature_message else ""
+            reason = f"verified (signature advisory-only, status={signature_status}{detail} -- require_valid_signature is false)"
         else:
             reason = "verified"
         verified = True
@@ -203,7 +219,8 @@ def download_and_verify(package_id, version, config=None) -> VerificationResult:
         verified=verified, reason=reason, file_path=str(installer_path),
         expected_sha256=expected_sha256, actual_sha256=actual_sha256,
         hash_match=hash_match, signature_status=signature_status,
-        signer_subject=signer_subject, verification_mode="full",
+        signer_subject=signer_subject, signature_message=signature_message,
+        verification_mode="full",
     )
 
 
@@ -219,6 +236,7 @@ def verify_and_record(package_id, version, config=None) -> VerificationResult:
         expected_sha256=result.expected_sha256, actual_sha256=result.actual_sha256,
         signature_status=result.signature_status, signer_subject=result.signer_subject,
         verification_mode=result.verification_mode, verified=result.verified,
+        reason=result.reason, signature_message=result.signature_message,
     )
     return result
 

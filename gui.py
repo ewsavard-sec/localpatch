@@ -240,7 +240,7 @@ class LocalPatchApp:
 
         win = tk.Toplevel(self.root)
         win.title(f"Verification Log — {app['name']}")
-        win.geometry("480x380")
+        win.geometry("520x480")
         win.resizable(False, False)
 
         frame = ttk.Frame(win, padding=16)
@@ -255,11 +255,13 @@ class LocalPatchApp:
             ("Package", pkg_id),
             ("Version", entry["version"]),
             ("Result", "Verified" if entry["verified"] else "Failed"),
+            ("Reason", entry["reason"] or "-"),
             ("Verification mode", entry["verification_mode"]),
             ("Expected SHA256", entry["expected_sha256"] or "-"),
             ("Actual SHA256", entry["actual_sha256"] or "-"),
             ("Hash match", "Yes" if entry["hash_match"] else "No"),
             ("Signature status", entry["signature_status"] or "-"),
+            ("Signature message", entry["signature_message"] or "-"),
             ("Signer subject", entry["signer_subject"] or "(none)"),
             ("Checked at", entry["downloaded_at"]),
             ("File path", entry["file_path"] or "-"),
@@ -267,7 +269,7 @@ class LocalPatchApp:
         for i, (label, value) in enumerate(rows):
             ttk.Label(frame, text=f"{label}:", font=("Segoe UI", 9, "bold")).grid(
                 row=i, column=0, sticky="ne", pady=2)
-            ttk.Label(frame, text=str(value), wraplength=320, justify="left").grid(
+            ttk.Label(frame, text=str(value), wraplength=360, justify="left").grid(
                 row=i, column=1, sticky="w", padx=(8, 0), pady=2)
 
     # ---------- Rendering ----------

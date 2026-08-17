@@ -98,7 +98,7 @@ def test_patch_store_unsigned_blocked_by_default(isolated_env, monkeypatch):
         return True, "ok"
 
     monkeypatch.setattr(patch_store, "_run_winget_download", fake_download)
-    monkeypatch.setattr(patch_store, "_check_signature", lambda *a, **k: ("NotSigned", None))
+    monkeypatch.setattr(patch_store, "_check_signature", lambda *a, **k: ("NotSigned", None, "The file is not digitally signed."))
 
     result = patch_store.download_and_verify("fake.pkg", "1.0", config={"require_valid_signature": True})
 
@@ -119,7 +119,7 @@ def test_patch_store_advisory_signature_when_not_required(isolated_env, monkeypa
         return True, "ok"
 
     monkeypatch.setattr(patch_store, "_run_winget_download", fake_download)
-    monkeypatch.setattr(patch_store, "_check_signature", lambda *a, **k: ("NotSigned", None))
+    monkeypatch.setattr(patch_store, "_check_signature", lambda *a, **k: ("NotSigned", None, "The file is not digitally signed."))
 
     result = patch_store.download_and_verify("fake.pkg", "1.0", config={"require_valid_signature": False})
 

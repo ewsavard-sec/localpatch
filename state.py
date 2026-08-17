@@ -38,12 +38,23 @@ CREATE TABLE IF NOT EXISTS patch_cache (
     hash_match INTEGER,
     signature_status TEXT,      -- e.g. 'Valid', 'NotSigned', 'HashMismatch', 'NotTrusted'
     signer_subject TEXT,
+    signature_message TEXT,     -- PowerShell's own explanation of signature_status
     verification_mode TEXT,     -- 'full' | 'manifest-only'
     verified INTEGER,           -- 1 if all applicable checks passed
+    reason TEXT,                -- human-readable summary of why verified/blocked
     downloaded_at TEXT,
     PRIMARY KEY (package_id, version)
 );
 """
+
+# Columns added to patch_cache after its initial release. CREATE TABLE IF
+# NOT EXISTS above only applies to brand-new databases -- an existing
+# localpatch.db from before these columns existed needs them added via
+# ALTER TABLE, or every read/write of them will fail.
+_PATCH_CACHE_MIGRATIONS = [
+    ("signature_message", "TEXT"),
+    ("reason", "TEXT"),
+]
 
 
 @contextmanager
@@ -60,6 +71,10 @@ def get_conn():
 def init_db():
     with get_conn() as conn:
         conn.executescript(SCHEMA)
+        existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(patch_cache)").fetchall()}
+        for col, coltype in _PATCH_CACHE_MIGRATIONS:
+            if col not in existing_cols:
+                conn.execute(f"ALTER TABLE patch_cache ADD COLUMN {col} {coltype}")
 
 
 def upsert_app(package_id, name, source, installed_version, available_version):
@@ -123,23 +138,27 @@ def get_all_apps():
 
 
 def record_patch_download(package_id, version, file_path, expected_sha256, actual_sha256,
-                           signature_status, signer_subject, verification_mode, verified):
+                           signature_status, signer_subject, verification_mode, verified,
+                           reason=None, signature_message=None):
     now = time.strftime("%Y-%m-%dT%H:%M:%S")
     hash_match = 1 if expected_sha256 and actual_sha256 and expected_sha256.lower() == actual_sha256.lower() else 0
     with get_conn() as conn:
         conn.execute(
             """INSERT INTO patch_cache
                (package_id, version, file_path, expected_sha256, actual_sha256, hash_match,
-                signature_status, signer_subject, verification_mode, verified, downloaded_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                signature_status, signer_subject, signature_message, verification_mode,
+                verified, reason, downloaded_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(package_id, version) DO UPDATE SET
                  file_path=excluded.file_path, expected_sha256=excluded.expected_sha256,
                  actual_sha256=excluded.actual_sha256, hash_match=excluded.hash_match,
                  signature_status=excluded.signature_status, signer_subject=excluded.signer_subject,
+                 signature_message=excluded.signature_message,
                  verification_mode=excluded.verification_mode, verified=excluded.verified,
-                 downloaded_at=excluded.downloaded_at""",
+                 reason=excluded.reason, downloaded_at=excluded.downloaded_at""",
             (package_id, version, file_path, expected_sha256, actual_sha256, hash_match,
-             signature_status, signer_subject, verification_mode, 1 if verified else 0, now),
+             signature_status, signer_subject, signature_message, verification_mode,
+             1 if verified else 0, reason, now),
         )
 
 
