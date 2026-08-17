@@ -35,6 +35,16 @@ DEFAULT_CONFIG = {
     "nvd_api_key": "",
     "retention_days": 180,
     "notify_new_cves": True,
+    # Defaults to False: when `winget download` can't be used, patch_store
+    # falls back to trusting winget's own manifest-reported hash instead
+    # of independently downloading and hashing a file. That's a real, but
+    # materially weaker, guarantee -- see patch_store._fallback_manifest_only.
+    # Leave this off unless you've accepted that tradeoff explicitly.
+    "allow_manifest_only_verification": False,
+    # Mirrors patch_store.verify_and_record's own default -- kept True so a
+    # fresh install (or a config.json predating this key) is at least as
+    # strict as patch_store's fallback, not silently weaker than it.
+    "require_valid_signature": True,
 }
 
 
@@ -58,7 +68,19 @@ def run_scan(cfg):
 
     for pkg_id, app in installed.items():
         available = upgrades.get(pkg_id, {}).get("Available")
-        release_date = scanner.get_release_date(pkg_id, available) if available else None
+        release_date = None
+        if available:
+            # scanner.get_release_date() is a `winget show` subprocess call
+            # per package -- if the prior scan already saw this exact
+            # available_version and recorded a non-empty release_date for
+            # it, that date is still correct (a version's release date
+            # doesn't change), so reuse it instead of re-shelling out to
+            # winget for a result we already know.
+            prev = prev_apps_by_id.get(pkg_id) or {}
+            if prev.get("available_version") == available and prev.get("release_date"):
+                release_date = prev["release_date"]
+            else:
+                release_date = scanner.get_release_date(pkg_id, available)
         state.upsert_app(
             package_id=pkg_id, name=app["Name"], source=app.get("Source", ""),
             installed_version=app["Version"], available_version=available,
@@ -89,7 +111,7 @@ def run_auto(cfg):
                 app_log.warning(f"Blocked deploy: {name} {version} -- {result.reason}")
                 print(f"  {name}: BLOCKED — failed verification ({result.reason})")
                 continue
-            success, log = deployer.deploy(package_id)
+            success, log = deployer.deploy(package_id, version)
             state.mark_deployed(package_id, version, success)
             if success:
                 app_log.info(f"Deployed: {name} {version}")

@@ -19,6 +19,8 @@ you're scanning more than a handful of apps.
 import time
 import requests
 
+import state
+
 NVD_CPE_URL = "https://services.nvd.nist.gov/rest/json/cpes/2.0"
 NVD_CVE_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 
@@ -41,6 +43,24 @@ class CveMatcher:
         self._last_request = time.time()
 
     def _find_cpe(self, product_name):
+        """
+        Resolves product_name -> CPE, backed by a persistent cache
+        (state.get_cached_cpe / state.set_cached_cpe).
+
+        IMPORTANT: this cache is for the product-name -> CPE mapping ONLY.
+        That mapping is genuinely stable (a product's CPE identity doesn't
+        change), which is why the module docstring calls it the
+        expensive/heuristic-but-stable part of a lookup. Do NOT extend this
+        caching approach to CVE results themselves (see lookup() below) --
+        new CVEs get disclosed against unchanged software constantly, so
+        caching CVE results would silently hide newly-disclosed
+        vulnerabilities on software nobody touched. Only identity
+        resolution is safe to cache; vulnerability data is not.
+        """
+        found, cached_cpe = state.get_cached_cpe(product_name)
+        if found:
+            return cached_cpe
+
         self._throttle()
         try:
             resp = requests.get(
@@ -52,12 +72,19 @@ class CveMatcher:
             resp.raise_for_status()
             products = resp.json().get("products", [])
             if not products:
+                state.set_cached_cpe(product_name, None)  # cache the negative result too
                 return None
             # Naive best match: shortest cpeName is usually the base product entry
             # rather than a specific edition/language variant.
             best = min(products, key=lambda p: len(p["cpe"]["cpeName"]))
-            return best["cpe"]["cpeName"]
+            cpe_name = best["cpe"]["cpeName"]
+            state.set_cached_cpe(product_name, cpe_name)
+            return cpe_name
         except (requests.RequestException, KeyError, ValueError):
+            # Deliberately NOT cached: this is a lookup failure (network,
+            # rate limit, malformed response), not a confirmed "no CPE
+            # exists" result -- caching it would permanently blind this
+            # product to future CVE lookups over a transient hiccup.
             return None
 
     def lookup(self, product_name, version):

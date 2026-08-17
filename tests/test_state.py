@@ -124,6 +124,107 @@ def test_parse_anchor_timestamp():
     assert state.parse_anchor_timestamp("") is None
 
 
+# ---------- C1: upsert_app must not wipe release_date on a transient None ----------
+
+def test_upsert_app_preserves_release_date_when_version_unchanged_and_lookup_returns_none(isolated_env):
+    # Reproduction from the bug report: a real release_date 30 days old
+    # (eligible under a 7-day delay) must survive a later scan whose
+    # get_release_date() call had a transient failure and returned None,
+    # as long as available_version didn't actually change.
+    state.upsert_app("pkg.i", "Pkg I", "winget", "1.0", "2.0", release_date=_date_only(30))
+    row = state.get_all_apps()[0]
+    assert row["release_date"] == _date_only(30)
+
+    # Simulates a later scan hitting a transient lookup failure.
+    state.upsert_app("pkg.i", "Pkg I", "winget", "1.0", "2.0", release_date=None)
+
+    row = state.get_all_apps()[0]
+    assert row["release_date"] == _date_only(30)
+    # And the app must still be eligible -- this is the actual bug: it used
+    # to silently fall back to first_seen_available (unset here) and drop
+    # out of eligibility.
+    assert [a["package_id"] for a in state.get_eligible_for_autodeploy(delay_days=7)] == ["pkg.i"]
+
+
+def test_upsert_app_updates_release_date_when_version_changes(isolated_env):
+    state.upsert_app("pkg.j", "Pkg J", "winget", "1.0", "2.0", release_date=_date_only(30))
+    row = state.get_all_apps()[0]
+    assert row["release_date"] == _date_only(30)
+
+    # A genuinely new version is released, and winget doesn't (yet) report
+    # a release date for it -- None here is the correct new value, not a
+    # transient failure to paper over.
+    state.upsert_app("pkg.j", "Pkg J", "winget", "1.0", "3.0", release_date=None)
+
+    row = state.get_all_apps()[0]
+    assert row["available_version"] == "3.0"
+    assert row["release_date"] is None
+
+    # And a version change WITH a real release_date is written as given.
+    state.upsert_app("pkg.j", "Pkg J", "winget", "1.0", "4.0", release_date=_date_only(1))
+    row = state.get_all_apps()[0]
+    assert row["available_version"] == "4.0"
+    assert row["release_date"] == _date_only(1)
+
+
+# ---------- C2: reconcile_stuck_deploys ----------
+
+def test_reconcile_stuck_deploys_resets_deploying_to_failed(isolated_env):
+    state.upsert_app("pkg.k", "Pkg K", "winget", "1.0", "2.0")
+    with state.get_conn() as conn:
+        conn.execute("UPDATE apps SET deploy_status='deploying' WHERE package_id=?", ("pkg.k",))
+
+    count = state.reconcile_stuck_deploys()
+
+    assert count == 1
+    assert state.get_all_apps()[0]["deploy_status"] == "failed"
+
+
+def test_reconcile_stuck_deploys_leaves_normal_statuses_untouched(isolated_env):
+    state.upsert_app("pkg.l", "Pkg L", "winget", "1.0", "2.0")
+    with state.get_conn() as conn:
+        conn.execute("UPDATE apps SET deploy_status='idle' WHERE package_id=?", ("pkg.l",))
+    state.upsert_app("pkg.m", "Pkg M", "winget", "1.0", "2.0")
+    state.mark_deployed("pkg.m", "2.0", success=True)  # deploy_status='deployed'
+
+    count = state.reconcile_stuck_deploys()
+
+    assert count == 0
+    statuses = {a["package_id"]: a["deploy_status"] for a in state.get_all_apps()}
+    assert statuses["pkg.l"] == "idle"
+    assert statuses["pkg.m"] == "deployed"
+
+
+# ---------- C3: schema-verified-once optimization must preserve self-healing ----------
+
+def test_get_conn_self_heals_after_db_file_deleted_externally(isolated_env):
+    # Normal use establishes the schema and marks this DB_PATH verified.
+    state.upsert_app("pkg.n", "Pkg N", "winget", "1.0", "2.0")
+    assert state._schema_verified_path == state.DB_PATH
+
+    # Simulate the db file being deleted out from under a running process
+    # (e.g. by an external tool, or a user cleaning up files by hand).
+    state.DB_PATH.unlink()
+
+    # _schema_verified_path is still set to this path even though the file
+    # itself is gone -- the next connection opens a brand-new, table-less
+    # file and _ensure_schema skips re-running its DDL because it thinks
+    # the schema is already verified for this path. Per the documented
+    # design, this one call is expected to surface the resulting "no such
+    # table" failure to the caller (its query really did fail against the
+    # now-empty db)...
+    with pytest.raises(state.sqlite3.OperationalError, match="no such table"):
+        state.upsert_app("pkg.n", "Pkg N", "winget", "1.0", "2.0")
+
+    # ...but it must also have cleared _schema_verified_path so schema
+    # setup re-runs on the NEXT connection, self-healing without any
+    # manual intervention.
+    assert state._schema_verified_path is None
+    state.upsert_app("pkg.n", "Pkg N", "winget", "1.0", "2.0")
+    assert state._schema_verified_path == state.DB_PATH
+    assert [a["package_id"] for a in state.get_all_apps()] == ["pkg.n"]
+
+
 # ---------- patch_store verification (mocked winget calls) ----------
 
 def test_patch_store_hash_mismatch_blocks(isolated_env, monkeypatch):
