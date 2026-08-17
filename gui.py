@@ -12,6 +12,7 @@ import json
 import time
 import threading
 import traceback
+import webbrowser
 import tkinter as tk
 from tkinter import ttk, messagebox
 from pathlib import Path
@@ -70,6 +71,12 @@ DEFAULT_CONFIG = {
     # fresh install (or a config.json predating this key) is at least as
     # strict as patch_store's fallback, not silently weaker than it.
     "require_valid_signature": True,
+    # Tracks whether the first-run NVD API key prompt has already been
+    # shown/dismissed, so it appears at most once ever -- not a recurring
+    # nag on every launch. Only actually shown when nvd_api_key is also
+    # empty (see _maybe_show_key_prompt), so anyone who already has a key
+    # configured never sees it regardless of this flag.
+    "nvd_key_prompt_dismissed": False,
 }
 
 TABLE_COLUMNS = ("name", "installed", "available", "days_left", "cves", "verification", "status")
@@ -130,6 +137,10 @@ class LocalPatchApp:
         state.init_db()
         self._reconcile_interrupted_deploys()
         self.refresh_table()
+        # Deferred so the main window is already up and rendered before a
+        # dialog appears on top of it -- feels like a follow-up, not a
+        # blocking gate the app makes you clear before it'll even show.
+        self.root.after(400, self._maybe_show_key_prompt)
 
     def _reconcile_interrupted_deploys(self):
         """
@@ -153,6 +164,69 @@ class LocalPatchApp:
                 f"Reset {count} app(s) stuck in 'deploying' status -- interrupted "
                 f"(app was closed or crashed) mid-deploy on a previous run."
             )
+
+    def _dismiss_key_prompt(self, win):
+        self.cfg["nvd_key_prompt_dismissed"] = True
+        save_config(self.cfg)
+        win.destroy()
+
+    def _maybe_show_key_prompt(self):
+        """
+        One-time, dismissible nudge toward setting an NVD API key: without
+        one, CVE lookups are throttled to 5 requests/30s, which is the
+        difference between a multi-minute and a multi-second scan on a
+        machine with a couple hundred apps. Shown at most once ever --
+        skipping or closing it (same as adding a key) marks it dismissed
+        permanently, so this is a one-time offer, not a recurring nag.
+        """
+        if self.cfg.get("nvd_api_key") or self.cfg.get("nvd_key_prompt_dismissed"):
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("Speed up CVE scanning (optional)")
+        win.geometry("440x290")
+        win.resizable(False, False)
+        win.configure(background=COLORS["surface"])
+        win.transient(self.root)
+        win.protocol("WM_DELETE_WINDOW", lambda: self._dismiss_key_prompt(win))
+
+        pad = ttk.Frame(win, padding=SPACE["lg"])
+        pad.pack(fill="both", expand=True)
+
+        ttk.Label(pad, text="Get a free NVD API key?", font=FONT_UI_BOLD,
+                  background=COLORS["surface"], foreground=COLORS["text"]).pack(anchor="w")
+        ttk.Label(
+            pad,
+            text=(
+                "Without a key, CVE lookups are limited to 5 requests every "
+                "30 seconds. A free key raises that to 50 -- roughly 10x "
+                "faster scans on a machine with a lot of installed software. "
+                "This is completely optional and takes about a minute."
+            ),
+            wraplength=390, justify="left", background=COLORS["surface"], foreground=COLORS["muted"],
+        ).pack(anchor="w", pady=(SPACE["sm"], SPACE["md"]))
+
+        key_var = tk.StringVar(value="")
+        ttk.Label(pad, text="Paste your key here (optional):",
+                  background=COLORS["surface"], foreground=COLORS["text"]).pack(anchor="w")
+        ttk.Entry(pad, textvariable=key_var, width=40, show="*").pack(anchor="w", pady=(SPACE["xs"], SPACE["md"]))
+
+        def get_key():
+            webbrowser.open("https://nvd.nist.gov/developers/request-an-api-key")
+
+        def save_and_dismiss():
+            key = key_var.get().strip()
+            if key:
+                self.cfg["nvd_api_key"] = key
+            self._dismiss_key_prompt(win)
+
+        btn_row = ttk.Frame(pad, style="TFrame")
+        btn_row.pack(fill="x", pady=(SPACE["sm"], 0))
+        ttk.Button(btn_row, text="Get a free key", cursor="hand2", command=get_key).pack(side="left")
+        ttk.Button(btn_row, text="Skip for now", cursor="hand2",
+                   command=lambda: self._dismiss_key_prompt(win)).pack(side="right")
+        ttk.Button(btn_row, text="Save key", style="Accent.TButton", cursor="hand2",
+                   command=save_and_dismiss).pack(side="right", padx=(0, SPACE["sm"]))
 
     # ---------- Theming ----------
 

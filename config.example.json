@@ -6,5 +6,6 @@
   "retention_days": 180,
   "notify_new_cves": true,
   "allow_manifest_only_verification": false,
-  "require_valid_signature": true
+  "require_valid_signature": true,
+  "nvd_key_prompt_dismissed": false
 }

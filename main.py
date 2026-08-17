@@ -45,6 +45,10 @@ DEFAULT_CONFIG = {
     # fresh install (or a config.json predating this key) is at least as
     # strict as patch_store's fallback, not silently weaker than it.
     "require_valid_signature": True,
+    # GUI-only (see gui.py's first-run key prompt) -- kept here too so this
+    # dict stays the authoritative shape of config.json across both entry
+    # points, same reasoning as require_valid_signature above.
+    "nvd_key_prompt_dismissed": False,
 }
 
 
