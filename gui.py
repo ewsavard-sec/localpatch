@@ -41,9 +41,16 @@ COLORS = {
     "warning": "#F59E0B",
 }
 
-FONT_UI = ("Segoe UI", 9)
-FONT_UI_BOLD = ("Segoe UI", 9, "bold")
-FONT_MONO = ("Consolas", 9)
+# 4/8px spacing scale -- every pack/grid pad below is one of these.
+SPACE = {"xs": 4, "sm": 8, "md": 12, "lg": 16, "xl": 24}
+
+FONT_TITLE = ("Segoe UI", 16, "bold")
+FONT_SUBTITLE = ("Segoe UI", 9)
+FONT_UI = ("Segoe UI", 10)
+FONT_UI_BOLD = ("Segoe UI", 10, "bold")
+FONT_MONO = ("Consolas", 10)
+FONT_STAT_VALUE = ("Segoe UI", 16, "bold")
+FONT_STAT_LABEL = ("Segoe UI", 8, "bold")
 
 DEFAULT_CONFIG = {
     "delay_days": 7,
@@ -51,6 +58,17 @@ DEFAULT_CONFIG = {
     "run_time": "09:00",
     "nvd_api_key": "",
     "retention_days": 180,
+}
+
+TABLE_COLUMNS = ("name", "installed", "available", "days_left", "cves", "verification", "status")
+TABLE_HEADINGS = {
+    "name": "Application", "installed": "Installed", "available": "Available",
+    "days_left": "Days Until Auto-Deploy", "cves": "Known CVEs",
+    "verification": "Verification", "status": "Status",
+}
+TABLE_WIDTHS = {
+    "name": 230, "installed": 110, "available": 110, "days_left": 175,
+    "cves": 190, "verification": 175, "status": 90,
 }
 
 
@@ -70,13 +88,16 @@ class LocalPatchApp:
     def __init__(self, root):
         self.root = root
         self.root.title("LocalPatch")
-        self.root.geometry("1040x600")
-        self.root.minsize(860, 440)
+        self.root.geometry("1100x680")
+        self.root.minsize(920, 480)
         self.cfg = load_config()
         self._scan_active = False
         self._scan_cancel_event = None
+        # Soonest-eligible-first by default -- the most actionable rows surface at the top.
+        self._sort_state = {"column": "days_left", "reverse": False}
 
         self._apply_theme()
+        self._build_header()
         self._build_toolbar()
         self._build_table()
         self._build_statusbar()
@@ -104,20 +125,41 @@ class LocalPatchApp:
         style.configure("TFrame", background=COLORS["bg"])
         style.configure("TLabel", background=COLORS["bg"], foreground=COLORS["text"], font=FONT_UI)
         style.configure("TCheckbutton", background=COLORS["bg"], foreground=COLORS["text"], font=FONT_UI)
+        style.map("TCheckbutton", background=[("active", COLORS["bg"])])
 
-        style.configure("TButton", font=FONT_UI, padding=(10, 6),
+        style.configure("Header.TFrame", background=COLORS["surface_alt"])
+        style.configure("HeaderTitle.TLabel", background=COLORS["surface_alt"],
+                         foreground=COLORS["text"], font=FONT_TITLE)
+        style.configure("HeaderSubtitle.TLabel", background=COLORS["surface_alt"],
+                         foreground=COLORS["muted"], font=FONT_SUBTITLE)
+
+        style.configure("TButton", font=FONT_UI, padding=(12, 7),
                          background=COLORS["surface"], foreground=COLORS["text"],
                          bordercolor=COLORS["border"], focuscolor=COLORS["accent"])
         style.map("TButton",
-                   background=[("active", COLORS["border"]), ("pressed", COLORS["border"])])
+                   background=[("active", COLORS["border"]), ("pressed", COLORS["border"])],
+                   foreground=[("disabled", COLORS["muted"])])
 
-        style.configure("Accent.TButton", font=FONT_UI_BOLD, padding=(10, 6),
+        # Primary action -- there is exactly one per screen (Scan Now).
+        style.configure("Accent.TButton", font=FONT_UI_BOLD, padding=(12, 7),
                          background=COLORS["accent"], foreground=COLORS["accent_fg"],
                          bordercolor=COLORS["accent"])
         style.map("Accent.TButton",
-                   background=[("active", "#1CA750"), ("pressed", "#189245")])
+                   background=[("active", "#1CA750"), ("pressed", "#189245"),
+                               ("disabled", COLORS["surface"])],
+                   foreground=[("disabled", COLORS["muted"])])
 
-        style.configure("TMenubutton", font=FONT_UI, padding=(10, 6),
+        # Destructive/interrupt action -- outlined red so it reads as "stop", not just gray-disabled.
+        style.configure("Danger.TButton", font=FONT_UI, padding=(12, 7),
+                         background=COLORS["surface"], foreground=COLORS["danger"],
+                         bordercolor=COLORS["danger"])
+        style.map("Danger.TButton",
+                   background=[("active", "#3A1520"), ("pressed", "#3A1520"),
+                               ("disabled", COLORS["surface"])],
+                   foreground=[("disabled", COLORS["muted"])],
+                   bordercolor=[("disabled", COLORS["border"])])
+
+        style.configure("TMenubutton", font=FONT_UI, padding=(12, 7),
                          background=COLORS["surface"], foreground=COLORS["text"],
                          bordercolor=COLORS["border"], arrowcolor=COLORS["text"])
         style.map("TMenubutton", background=[("active", COLORS["border"])])
@@ -128,7 +170,11 @@ class LocalPatchApp:
                          background=COLORS["surface"], bordercolor=COLORS["border"],
                          arrowcolor=COLORS["text"])
 
-        style.configure("Treeview", font=FONT_MONO, rowheight=26,
+        style.configure("TLabelframe", background=COLORS["bg"], bordercolor=COLORS["border"])
+        style.configure("TLabelframe.Label", background=COLORS["bg"], foreground=COLORS["muted"],
+                         font=FONT_UI_BOLD)
+
+        style.configure("Treeview", font=FONT_MONO, rowheight=28,
                          background=COLORS["surface"], fieldbackground=COLORS["surface"],
                          foreground=COLORS["text"], bordercolor=COLORS["border"], borderwidth=0)
         style.configure("Treeview.Heading", font=FONT_UI_BOLD,
@@ -143,6 +189,7 @@ class LocalPatchApp:
                          troughcolor=COLORS["bg"], bordercolor=COLORS["border"], arrowcolor=COLORS["muted"])
         style.configure("Horizontal.TScrollbar", background=COLORS["surface"],
                          troughcolor=COLORS["bg"], bordercolor=COLORS["border"], arrowcolor=COLORS["muted"])
+        style.configure("TSeparator", background=COLORS["border"])
 
         style.configure("StatusBar.TFrame", background=COLORS["surface_alt"])
         style.configure("TProgressbar", troughcolor=COLORS["surface_alt"], background=COLORS["accent"],
@@ -154,60 +201,110 @@ class LocalPatchApp:
 
     # ---------- UI construction ----------
 
+    def _build_header(self):
+        header = ttk.Frame(self.root, style="Header.TFrame", padding=(SPACE["lg"], SPACE["md"]))
+        header.pack(fill="x")
+
+        title_box = ttk.Frame(header, style="Header.TFrame")
+        title_box.pack(side="left")
+        ttk.Label(title_box, text="LocalPatch", style="HeaderTitle.TLabel").pack(anchor="w")
+        ttk.Label(title_box, text="Local software inventory & patch verification",
+                  style="HeaderSubtitle.TLabel").pack(anchor="w")
+
+        stats_box = ttk.Frame(header, style="Header.TFrame")
+        stats_box.pack(side="right")
+
+        self.stat_pending_var = tk.StringVar(value="0")
+        self.stat_critical_var = tk.StringVar(value="0")
+        self.stat_unverified_var = tk.StringVar(value="0")
+
+        self._build_stat(stats_box, self.stat_pending_var, "PENDING UPDATES", COLORS["text"])
+        ttk.Separator(stats_box, orient="vertical").pack(side="left", fill="y", padx=SPACE["lg"])
+        self._build_stat(stats_box, self.stat_critical_var, "CRITICAL CVEs", COLORS["danger"])
+        ttk.Separator(stats_box, orient="vertical").pack(side="left", fill="y", padx=SPACE["lg"])
+        self._build_stat(stats_box, self.stat_unverified_var, "NOT VERIFIED", COLORS["warning"])
+
+        ttk.Separator(self.root, orient="horizontal").pack(fill="x")
+
+    @staticmethod
+    def _build_stat(parent, var, label, color):
+        box = ttk.Frame(parent, style="Header.TFrame")
+        box.pack(side="left")
+        tk.Label(box, textvariable=var, font=FONT_STAT_VALUE,
+                 background=COLORS["surface_alt"], foreground=color).pack(anchor="e")
+        tk.Label(box, text=label, font=FONT_STAT_LABEL,
+                 background=COLORS["surface_alt"], foreground=COLORS["muted"]).pack(anchor="e")
+
     def _build_toolbar(self):
-        bar = ttk.Frame(self.root, padding=10)
+        bar = ttk.Frame(self.root, padding=(SPACE["lg"], SPACE["sm"]))
         bar.pack(fill="x")
 
-        self.scan_button = ttk.Button(bar, text="Scan Now", style="Accent.TButton", command=self.on_scan)
-        self.scan_button.pack(side="left", padx=(0, 6))
+        self.scan_button = ttk.Button(bar, text="Scan Now", style="Accent.TButton",
+                                       cursor="hand2", command=self.on_scan)
+        self.scan_button.pack(side="left")
 
-        self.stop_scan_button = ttk.Button(bar, text="Stop Scan", command=self.on_stop_scan)
+        self.stop_scan_button = ttk.Button(bar, text="Stop Scan", style="Danger.TButton",
+                                            cursor="hand2", command=self.on_stop_scan)
         self.stop_scan_button.state(["disabled"])
-        self.stop_scan_button.pack(side="left", padx=6)
+        self.stop_scan_button.pack(side="left", padx=(SPACE["sm"], 0))
 
-        ttk.Button(bar, text="Deploy Selected", command=self.on_deploy_selected).pack(side="left", padx=6)
-        ttk.Button(bar, text="Deploy All Eligible", command=self.on_deploy_eligible).pack(side="left", padx=6)
+        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=SPACE["lg"])
+
+        ttk.Button(bar, text="Deploy Selected", cursor="hand2",
+                   command=self.on_deploy_selected).pack(side="left")
+        ttk.Button(bar, text="Deploy All Eligible", cursor="hand2",
+                   command=self.on_deploy_eligible).pack(side="left", padx=(SPACE["sm"], 0))
+
+        ttk.Button(bar, text="Settings", cursor="hand2", command=self.on_settings).pack(side="right")
 
         logs_menu = tk.Menu(self.root, tearoff=False, background=COLORS["surface"],
                              foreground=COLORS["text"], activebackground=COLORS["border"],
                              activeforeground=COLORS["text"], borderwidth=0)
         logs_menu.add_command(label="Verification Log (selected app)", command=self.on_view_verification_log)
         logs_menu.add_command(label="Status Log (all events)", command=self.on_view_status_log)
-        ttk.Menubutton(bar, text="View Logs", menu=logs_menu).pack(side="left", padx=6)
-
-        ttk.Button(bar, text="Settings", command=self.on_settings).pack(side="right")
+        ttk.Menubutton(bar, text="View Logs", menu=logs_menu, cursor="hand2").pack(
+            side="right", padx=(0, SPACE["sm"]))
 
     def _build_table(self):
         table_frame = ttk.Frame(self.root)
-        table_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        table_frame.pack(fill="both", expand=True, padx=SPACE["lg"], pady=(0, SPACE["lg"]))
         table_frame.rowconfigure(0, weight=1)
         table_frame.columnconfigure(0, weight=1)
 
-        columns = ("name", "installed", "available", "days_left", "cves", "verification", "status")
-        self.tree = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="extended")
-        headings = {
-            "name": "Application", "installed": "Installed", "available": "Available",
-            "days_left": "Days Until Auto-Deploy", "cves": "Known CVEs",
-            "verification": "Verification", "status": "Status",
-        }
-        widths = {"name": 220, "installed": 100, "available": 100, "days_left": 150,
-                  "cves": 180, "verification": 160, "status": 80}
-        for col in columns:
-            self.tree.heading(col, text=headings[col])
-            self.tree.column(col, width=widths[col], anchor="w")
+        self.tree = ttk.Treeview(table_frame, columns=TABLE_COLUMNS, show="headings", selectmode="extended")
+        for col in TABLE_COLUMNS:
+            self.tree.heading(col, text=TABLE_HEADINGS[col], command=lambda c=col: self._sort_by(c))
+            self.tree.column(col, width=TABLE_WIDTHS[col], anchor="w")
         self.tree.grid(row=0, column=0, sticky="nsew")
 
-        yscroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
-        yscroll.grid(row=0, column=1, sticky="ns")
-        self.tree.configure(yscrollcommand=yscroll.set)
+        self.yscroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
+        self.yscroll.grid(row=0, column=1, sticky="ns")
+        self.tree.configure(yscrollcommand=self.yscroll.set)
 
         # Dark-mode tints: subtle color washes rather than the light-mode
         # pastels a white-background app would use, so severity is still
-        # readable against the dark surface instead of glowing.
+        # readable against the dark surface instead of glowing. Rows with
+        # no CVE hit alternate between two near-identical shades (zebra
+        # striping) so long lists stay scannable without competing with
+        # the severity tint on the rows that actually need attention.
         self.tree.tag_configure("critical", background="#3A1520")
         self.tree.tag_configure("high", background="#3A2A12")
-        self.tree.tag_configure("clean", background=COLORS["surface"])
+        self.tree.tag_configure("clean_even", background=COLORS["surface"])
+        self.tree.tag_configure("clean_odd", background=COLORS["surface_alt"])
         self.tree.tag_configure("verify_failed", foreground=COLORS["danger"], font=FONT_UI_BOLD)
+
+        # Empty state -- shares the same grid cell as the table and swaps
+        # in via grid()/grid_remove() whenever there's nothing to show,
+        # whether that's "no scan run yet" or "everything is patched."
+        self.empty_state = ttk.Frame(table_frame)
+        inner = ttk.Frame(self.empty_state)
+        inner.place(relx=0.5, rely=0.42, anchor="center")
+        tk.Label(inner, text="✓", font=("Segoe UI", 30, "bold"),
+                 background=COLORS["bg"], foreground=COLORS["accent"]).pack()
+        tk.Label(inner, text="No pending updates", font=("Segoe UI", 13, "bold"),
+                 background=COLORS["bg"], foreground=COLORS["text"]).pack(pady=(SPACE["sm"], SPACE["xs"]))
+        tk.Label(inner, text="Run a scan to check installed software for updates and known CVEs.",
+                 font=FONT_UI, background=COLORS["bg"], foreground=COLORS["muted"]).pack()
 
     def _build_statusbar(self):
         bar = ttk.Frame(self.root, style="StatusBar.TFrame")
@@ -219,7 +316,7 @@ class LocalPatchApp:
 
         self.status_var = tk.StringVar(value="Ready.")
         self.status_label = tk.Label(
-            bar, textvariable=self.status_var, anchor="w", padx=10, pady=6,
+            bar, textvariable=self.status_var, anchor="w", padx=SPACE["md"], pady=SPACE["sm"],
             background=COLORS["surface_alt"], foreground=COLORS["muted"], font=FONT_UI,
         )
         self.status_label.pack(side="left", fill="x", expand=True)
@@ -245,7 +342,7 @@ class LocalPatchApp:
             self.progress.pack_forget()
             return
         self.progress.configure(mode="determinate", maximum=total, value=0)
-        self.progress.pack(side="right", padx=10, pady=6)
+        self.progress.pack(side="right", padx=SPACE["md"], pady=SPACE["sm"])
         self._set_status(f"Scanning 0/{total} apps... est. {self._format_duration(est_seconds)}")
 
     def _update_scan_progress(self, i, total, name, remaining_seconds):
@@ -272,7 +369,7 @@ class LocalPatchApp:
         self.stop_scan_button.state(["!disabled"])
 
         self.progress.configure(mode="indeterminate")
-        self.progress.pack(side="right", padx=10, pady=6)
+        self.progress.pack(side="right", padx=SPACE["md"], pady=SPACE["sm"])
         self.progress.start(12)
         self._set_status("Scanning installed software...")
         threading.Thread(target=self._scan_worker, args=(self._scan_cancel_event,), daemon=True).start()
@@ -432,27 +529,59 @@ class LocalPatchApp:
         win = tk.Toplevel(self.root)
         self._style_dialog(win)
         win.title("Settings")
-        win.geometry("400x420")
+        win.geometry("440x580")
         win.resizable(False, False)
 
-        ttk.Label(win, text="Delay before auto-deploying a new version (days):").pack(anchor="w", padx=12, pady=(12, 2))
-        delay_var = tk.IntVar(value=self.cfg["delay_days"])
-        ttk.Spinbox(win, from_=0, to=30, textvariable=delay_var, width=6).pack(anchor="w", padx=12)
+        container = ttk.Frame(win, padding=SPACE["lg"])
+        container.pack(fill="both", expand=True)
 
-        ttk.Label(win, text="Daily auto-run time (24h, HH:MM):").pack(anchor="w", padx=12, pady=(12, 2))
+        schedule_frame = ttk.LabelFrame(container, text="Scan Schedule", padding=SPACE["md"])
+        schedule_frame.pack(fill="x", pady=(0, SPACE["md"]))
+
+        ttk.Label(schedule_frame, text="Delay before auto-deploying a new version (days):").pack(anchor="w")
+        delay_var = tk.IntVar(value=self.cfg["delay_days"])
+        ttk.Spinbox(schedule_frame, from_=0, to=30, textvariable=delay_var, width=6).pack(
+            anchor="w", pady=(SPACE["xs"], SPACE["md"]))
+
+        ttk.Label(schedule_frame, text="Daily auto-run time (24h, HH:MM):").pack(anchor="w")
         time_var = tk.StringVar(value=self.cfg["run_time"])
-        ttk.Entry(win, textvariable=time_var, width=8).pack(anchor="w", padx=12)
+        ttk.Entry(schedule_frame, textvariable=time_var, width=8).pack(
+            anchor="w", pady=(SPACE["xs"], SPACE["md"]))
 
         auto_var = tk.BooleanVar(value=self.cfg["auto_run_enabled"])
-        ttk.Checkbutton(win, text="Enable automatic daily scan + deploy", variable=auto_var).pack(anchor="w", padx=12, pady=12)
+        ttk.Checkbutton(schedule_frame, text="Enable automatic daily scan + deploy",
+                         variable=auto_var).pack(anchor="w")
 
-        ttk.Label(win, text="NVD API key (optional, raises rate limit):").pack(anchor="w", padx=12, pady=(0, 2))
+        security_frame = ttk.LabelFrame(container, text="Security & Verification", padding=SPACE["md"])
+        security_frame.pack(fill="x", pady=(0, SPACE["md"]))
+
+        ttk.Label(security_frame, text="NVD API key (optional, raises rate limit):").pack(anchor="w")
         key_var = tk.StringVar(value=self.cfg.get("nvd_api_key", ""))
-        ttk.Entry(win, textvariable=key_var, width=36, show="*").pack(anchor="w", padx=12)
+        ttk.Entry(security_frame, textvariable=key_var, width=36, show="*").pack(
+            anchor="w", pady=(SPACE["xs"], 0))
 
-        ttk.Label(win, text="Keep cached patch downloads for (days):").pack(anchor="w", padx=12, pady=(12, 2))
+        storage_frame = ttk.LabelFrame(container, text="Storage", padding=SPACE["md"])
+        storage_frame.pack(fill="x", pady=(0, SPACE["md"]))
+
+        ttk.Label(storage_frame, text="Keep cached patch downloads for (days):").pack(anchor="w")
         retention_var = tk.IntVar(value=self.cfg.get("retention_days", 180))
-        ttk.Spinbox(win, from_=30, to=730, textvariable=retention_var, width=6).pack(anchor="w", padx=12)
+        ttk.Spinbox(storage_frame, from_=30, to=730, textvariable=retention_var, width=6).pack(
+            anchor="w", pady=(SPACE["xs"], SPACE["md"]))
+
+        def cleanup_now():
+            self.cfg["retention_days"] = retention_var.get()
+            summary = patch_store.purge_expired(self.cfg["retention_days"])
+            app_log.info(f"Manual cleanup: purged {summary['count']} cached patch(es), "
+                         f"freed {summary['bytes_freed']} bytes.")
+            messagebox.showinfo(
+                "Cleanup complete",
+                f"Purged {summary['count']} cached patch(es), "
+                f"freed {summary['bytes_freed'] / 1024:.1f} KB.",
+            )
+            self.refresh_table()
+
+        ttk.Button(storage_frame, text="Clean Up Old Patches Now", cursor="hand2",
+                   command=cleanup_now).pack(anchor="w")
 
         def save_and_close():
             self.cfg["delay_days"] = delay_var.get()
@@ -472,21 +601,8 @@ class LocalPatchApp:
             win.destroy()
             self.refresh_table()
 
-        def cleanup_now():
-            self.cfg["retention_days"] = retention_var.get()
-            summary = patch_store.purge_expired(self.cfg["retention_days"])
-            app_log.info(f"Manual cleanup: purged {summary['count']} cached patch(es), "
-                         f"freed {summary['bytes_freed']} bytes.")
-            messagebox.showinfo(
-                "Cleanup complete",
-                f"Purged {summary['count']} cached patch(es), "
-                f"freed {summary['bytes_freed'] / 1024:.1f} KB.",
-            )
-            self.refresh_table()
-
-        ttk.Button(win, text="Clean Up Old Patches Now", command=cleanup_now).pack(anchor="w", padx=12, pady=(16, 4))
-
-        ttk.Button(win, text="Save", style="Accent.TButton", command=save_and_close).pack(pady=12)
+        ttk.Button(container, text="Save", style="Accent.TButton", cursor="hand2",
+                   command=save_and_close).pack(pady=(SPACE["xs"], 0))
 
     def on_view_verification_log(self):
         selection = self.tree.selection()
@@ -502,10 +618,10 @@ class LocalPatchApp:
         win = tk.Toplevel(self.root)
         self._style_dialog(win)
         win.title(f"Verification Log — {app['name']}")
-        win.geometry("520x480")
+        win.geometry("520x500")
         win.resizable(False, False)
 
-        frame = ttk.Frame(win, padding=16)
+        frame = ttk.Frame(win, padding=SPACE["lg"])
         frame.pack(fill="both", expand=True)
 
         if entry is None:
@@ -513,11 +629,16 @@ class LocalPatchApp:
                       wraplength=440).pack(anchor="w")
             return
 
-        result_text = "Verified" if entry["verified"] else "Failed"
+        pill_color = COLORS["accent"] if entry["verified"] else COLORS["danger"]
+        pill_text = "✓ Verified" if entry["verified"] else "✗ Failed"
+        tk.Label(frame, text=pill_text, font=FONT_UI_BOLD, background=pill_color,
+                 foreground=COLORS["accent_fg"] if entry["verified"] else COLORS["text"],
+                 padx=SPACE["md"], pady=SPACE["xs"]).grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, SPACE["md"]))
+
         rows = [
             ("Package", pkg_id),
             ("Version", entry["version"]),
-            ("Result", result_text),
             ("Reason", entry["reason"] or "-"),
             ("Verification mode", entry["verification_mode"]),
             ("Expected SHA256", entry["expected_sha256"] or "-"),
@@ -529,14 +650,12 @@ class LocalPatchApp:
             ("Checked at", entry["downloaded_at"]),
             ("File path", entry["file_path"] or "-"),
         ]
-        for i, (label, value) in enumerate(rows):
+        for i, (label, value) in enumerate(rows, start=1):
             ttk.Label(frame, text=f"{label}:", font=FONT_UI_BOLD).grid(
                 row=i, column=0, sticky="ne", pady=2)
-            value_color = COLORS["accent"] if (label == "Result" and entry["verified"]) else \
-                          COLORS["danger"] if label == "Result" else COLORS["text"]
             tk.Label(frame, text=str(value), wraplength=360, justify="left",
-                     background=COLORS["bg"], foreground=value_color, font=FONT_UI).grid(
-                row=i, column=1, sticky="w", padx=(8, 0), pady=2)
+                     background=COLORS["bg"], foreground=COLORS["text"], font=FONT_UI).grid(
+                row=i, column=1, sticky="w", padx=(SPACE["sm"], 0), pady=2)
 
     def on_view_status_log(self):
         win = tk.Toplevel(self.root)
@@ -547,7 +666,7 @@ class LocalPatchApp:
         win.rowconfigure(0, weight=1)
         win.columnconfigure(0, weight=1)
 
-        frame = ttk.Frame(win, padding=(12, 12, 12, 0))
+        frame = ttk.Frame(win, padding=(SPACE["md"], SPACE["md"], SPACE["md"], 0))
         frame.grid(row=0, column=0, sticky="nsew")
         frame.rowconfigure(0, weight=1)
         frame.columnconfigure(0, weight=1)
@@ -579,9 +698,9 @@ class LocalPatchApp:
             text.see("end")
             text.configure(state="disabled")
 
-        btn_bar = ttk.Frame(win, padding=12)
+        btn_bar = ttk.Frame(win, padding=SPACE["md"])
         btn_bar.grid(row=1, column=0, sticky="ew")
-        ttk.Button(btn_bar, text="Refresh", command=refresh).pack(side="left")
+        ttk.Button(btn_bar, text="Refresh", cursor="hand2", command=refresh).pack(side="left")
         tk.Label(btn_bar, text=f"Log file: {app_log.LOG_PATH}", background=COLORS["bg"],
                  foreground=COLORS["muted"], font=("Segoe UI", 8)).pack(side="right")
 
@@ -600,6 +719,41 @@ class LocalPatchApp:
             return "Failed — hash mismatch", True
         return "Failed — unsigned", True
 
+    def _sort_by(self, col):
+        if self._sort_state["column"] == col:
+            self._sort_state["reverse"] = not self._sort_state["reverse"]
+        else:
+            self._sort_state["column"] = col
+            self._sort_state["reverse"] = False
+        self.refresh_table()
+
+    @staticmethod
+    def _sort_key(col, row):
+        if col == "days_left":
+            val = row["days_left"]
+            if val == "Eligible now":
+                return -1.0
+            if val == "-":
+                return float("inf")
+            try:
+                return float(val)
+            except ValueError:
+                return float("inf")
+        if col == "cves":
+            return row["_cve_count"]
+        val = row.get(col, "")
+        return val.lower() if isinstance(val, str) else val
+
+    def _toggle_empty_state(self, is_empty):
+        if is_empty:
+            self.tree.grid_remove()
+            self.yscroll.grid_remove()
+            self.empty_state.grid(row=0, column=0, columnspan=2, sticky="nsew")
+        else:
+            self.empty_state.grid_remove()
+            self.tree.grid(row=0, column=0, sticky="nsew")
+            self.yscroll.grid(row=0, column=1, sticky="ns")
+
     def refresh_table(self):
         # Called repeatedly during a live scan (once per app), not just
         # once at the end -- preserve selection/scroll position across
@@ -608,8 +762,11 @@ class LocalPatchApp:
         selected = self.tree.selection()
         scroll_pos = self.tree.yview()
 
-        self.tree.delete(*self.tree.get_children())
         self._verification_cache = {(e["package_id"], e["version"]): e for e in state.get_patch_cache_entries()}
+
+        rows = []
+        critical_count = 0
+        unverified_count = 0
 
         for app in state.get_all_apps():
             if not app["available_version"] or app["available_version"] == app["installed_version"]:
@@ -621,20 +778,57 @@ class LocalPatchApp:
             sev_tag = "clean"
             if "CRITICAL" in severities:
                 sev_tag = "critical"
+                critical_count += 1
             elif "HIGH" in severities:
                 sev_tag = "high"
 
             entry = self._verification_cache.get((app["package_id"], app["available_version"]))
             verification_label, verify_failed = self._verification_label(entry)
+            if not (entry and entry["verified"]):
+                unverified_count += 1
 
-            days_left = self._days_left(app)
-            status = app["deploy_status"]
+            rows.append({
+                "package_id": app["package_id"],
+                "name": app["name"],
+                "installed": app["installed_version"],
+                "available": app["available_version"],
+                "days_left": self._days_left(app),
+                "cves": cve_text,
+                "_cve_count": len(cves),
+                "verification": verification_label,
+                "status": app["deploy_status"],
+                "_sev_tag": sev_tag,
+                "_verify_failed": verify_failed,
+            })
 
-            tags = (("verify_failed",) if verify_failed else ()) + (sev_tag,)
-            self.tree.insert("", "end", iid=app["package_id"], tags=tags, values=(
-                app["name"], app["installed_version"], app["available_version"],
-                days_left, cve_text, verification_label, status,
+        self.stat_pending_var.set(str(len(rows)))
+        self.stat_critical_var.set(str(critical_count))
+        self.stat_unverified_var.set(str(unverified_count))
+
+        sort_col = self._sort_state["column"]
+        rows.sort(key=lambda r: self._sort_key(sort_col, r), reverse=self._sort_state["reverse"])
+
+        for col in TABLE_COLUMNS:
+            text = TABLE_HEADINGS[col]
+            if col == sort_col:
+                text += "  ▼" if self._sort_state["reverse"] else "  ▲"
+            self.tree.heading(col, text=text)
+
+        self.tree.delete(*self.tree.get_children())
+        clean_index = 0
+        for row in rows:
+            if row["_sev_tag"] == "clean":
+                band_tag = "clean_even" if clean_index % 2 == 0 else "clean_odd"
+                clean_index += 1
+            else:
+                band_tag = row["_sev_tag"]
+            tags = (("verify_failed",) if row["_verify_failed"] else ()) + (band_tag,)
+            self.tree.insert("", "end", iid=row["package_id"], tags=tags, values=(
+                row["name"], row["installed"], row["available"],
+                row["days_left"], row["cves"], row["verification"], row["status"],
             ))
+
+        self._toggle_empty_state(len(rows) == 0)
 
         for iid in selected:
             if self.tree.exists(iid):
