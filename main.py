@@ -23,6 +23,7 @@ import deployer
 import scheduler
 import patch_store
 import app_log
+import notifier
 
 CONFIG_PATH = Path(__file__).parent / "config.json"
 CONFIG_EXAMPLE_PATH = Path(__file__).parent / "config.example.json"
@@ -33,6 +34,7 @@ DEFAULT_CONFIG = {
     "run_time": "09:00",
     "nvd_api_key": "",
     "retention_days": 180,
+    "notify_new_cves": True,
 }
 
 
@@ -48,6 +50,10 @@ def run_scan(cfg):
     state.init_db()
     installed = {a["Id"]: a for a in scanner.scan_installed()}
     upgrades = {a["Id"]: a for a in scanner.scan_upgrades()}
+    # Snapshot pre-scan CVE state once, up front -- diffed per-app below so
+    # a notification only fires for genuinely new CVEs, not the same known
+    # one every scan.
+    prev_apps_by_id = {a["package_id"]: a for a in state.get_all_apps()}
     matcher = cve_matcher.CveMatcher(api_key=cfg.get("nvd_api_key") or None)
 
     for pkg_id, app in installed.items():
@@ -59,6 +65,11 @@ def run_scan(cfg):
             release_date=release_date,
         )
         cves = matcher.lookup(app["Name"], app["Version"])
+        if cfg.get("notify_new_cves", True):
+            prev_cves = json.loads((prev_apps_by_id.get(pkg_id) or {}).get("cves") or "[]")
+            new_cves = notifier.diff_new_cves(prev_cves, cves)
+            if new_cves:
+                notifier.notify_new_cves(app["Name"], new_cves)
         state.set_cves(pkg_id, cves)
 
     print(f"Scanned {len(installed)} apps, {len(upgrades)} updates available.")

@@ -23,6 +23,7 @@ import deployer
 import scheduler
 import patch_store
 import app_log
+import notifier
 
 CONFIG_PATH = Path(__file__).parent / "config.json"
 CONFIG_EXAMPLE_PATH = Path(__file__).parent / "config.example.json"
@@ -58,6 +59,7 @@ DEFAULT_CONFIG = {
     "run_time": "09:00",
     "nvd_api_key": "",
     "retention_days": 180,
+    "notify_new_cves": True,
 }
 
 TABLE_COLUMNS = ("name", "installed", "available", "days_left", "cves", "verification", "status")
@@ -522,6 +524,10 @@ class LocalPatchApp:
         try:
             installed = {a["Id"]: a for a in scanner.scan_installed()}
             upgrades = {a["Id"]: a for a in scanner.scan_upgrades()}
+            # Snapshot pre-scan CVE state once, up front -- diffed per-app
+            # below so a notification only fires for genuinely new CVEs,
+            # not the same known one every scan.
+            prev_apps_by_id = {a["package_id"]: a for a in state.get_all_apps()}
 
             matcher = cve_matcher.CveMatcher(api_key=self.cfg.get("nvd_api_key") or None)
             total = len(installed)
@@ -550,6 +556,11 @@ class LocalPatchApp:
                     release_date=release_date,
                 )
                 cves = matcher.lookup(app["Name"], app["Version"])
+                if self.cfg.get("notify_new_cves", True):
+                    prev_cves = json.loads((prev_apps_by_id.get(pkg_id) or {}).get("cves") or "[]")
+                    new_cves = notifier.diff_new_cves(prev_cves, cves)
+                    if new_cves:
+                        notifier.notify_new_cves(app["Name"], new_cves)
                 state.set_cves(pkg_id, cves)
                 checked = i
 
@@ -737,6 +748,20 @@ class LocalPatchApp:
         ttk.Entry(security_frame, textvariable=key_var, width=36, show="*").pack(
             anchor="w", pady=(SPACE["xs"], 0))
 
+        notify_frame = ttk.LabelFrame(container, text="Notifications", padding=SPACE["md"])
+        notify_frame.pack(fill="x", pady=(0, SPACE["md"]))
+
+        notify_var = tk.BooleanVar(value=self.cfg.get("notify_new_cves", True))
+        ttk.Checkbutton(notify_frame, text="Notify me when a new CVE is found for an installed app",
+                         variable=notify_var).pack(anchor="w")
+        tk.Label(
+            notify_frame,
+            text="Windows toast notification, informative only (no click-to-open -- "
+                 "that needs a packaged app, which this isn't).",
+            font=("Segoe UI", 8), wraplength=340, justify="left",
+            background=COLORS["bg"], foreground=COLORS["muted"],
+        ).pack(anchor="w", pady=(SPACE["xs"], 0))
+
         storage_frame = ttk.LabelFrame(container, text="Storage", padding=SPACE["md"])
         storage_frame.pack(fill="x", pady=(0, SPACE["md"]))
 
@@ -765,6 +790,7 @@ class LocalPatchApp:
             self.cfg["run_time"] = time_var.get()
             self.cfg["auto_run_enabled"] = auto_var.get()
             self.cfg["nvd_api_key"] = key_var.get()
+            self.cfg["notify_new_cves"] = notify_var.get()
             self.cfg["retention_days"] = retention_var.get()
             save_config(self.cfg)
             try:
