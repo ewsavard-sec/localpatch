@@ -142,6 +142,10 @@ class LocalPatchApp:
         style.configure("Horizontal.TScrollbar", background=COLORS["surface"],
                          troughcolor=COLORS["bg"], bordercolor=COLORS["border"], arrowcolor=COLORS["muted"])
 
+        style.configure("StatusBar.TFrame", background=COLORS["surface_alt"])
+        style.configure("TProgressbar", troughcolor=COLORS["surface_alt"], background=COLORS["accent"],
+                         bordercolor=COLORS["surface_alt"], lightcolor=COLORS["accent"], darkcolor=COLORS["accent"])
+
     def _style_dialog(self, win):
         """Applies the app's dark background to a Toplevel (ttk styles apply globally already)."""
         win.configure(background=COLORS["bg"])
@@ -198,19 +202,52 @@ class LocalPatchApp:
         self.tree.tag_configure("verify_failed", foreground=COLORS["danger"], font=FONT_UI_BOLD)
 
     def _build_statusbar(self):
-        bar = ttk.Frame(self.root, style="TFrame")
+        bar = ttk.Frame(self.root, style="StatusBar.TFrame")
         bar.pack(fill="x", side="bottom")
+
+        self.progress = ttk.Progressbar(bar, orient="horizontal", length=220, mode="determinate")
+        # Not packed here -- only shown while a scan is running (see
+        # _start_scan_progress / _finish_scan_progress).
+
         self.status_var = tk.StringVar(value="Ready.")
         self.status_label = tk.Label(
             bar, textvariable=self.status_var, anchor="w", padx=10, pady=6,
             background=COLORS["surface_alt"], foreground=COLORS["muted"], font=FONT_UI,
         )
-        self.status_label.pack(fill="x")
+        self.status_label.pack(side="left", fill="x", expand=True)
 
     def _set_status(self, text, kind="info"):
         color = {"info": COLORS["muted"], "success": COLORS["accent"], "error": COLORS["danger"]}.get(kind, COLORS["muted"])
         self.status_var.set(text)
         self.status_label.configure(foreground=color)
+
+    @staticmethod
+    def _format_duration(seconds):
+        seconds = max(int(seconds), 0)
+        if seconds < 60:
+            return f"{seconds}s"
+        minutes, secs = divmod(seconds, 60)
+        if minutes < 60:
+            return f"{minutes}m {secs}s"
+        hours, minutes = divmod(minutes, 60)
+        return f"{hours}h {minutes}m"
+
+    def _start_scan_progress(self, total, est_seconds):
+        if total == 0:
+            self.progress.pack_forget()
+            return
+        self.progress.configure(mode="determinate", maximum=total, value=0)
+        self.progress.pack(side="right", padx=10, pady=6)
+        self._set_status(f"Scanning 0/{total} apps... est. {self._format_duration(est_seconds)}")
+
+    def _update_scan_progress(self, i, total, name, remaining_seconds):
+        self.progress.configure(value=i)
+        self._set_status(f"Scanning {i}/{total}: {name}... ~{self._format_duration(remaining_seconds)} remaining")
+
+    def _finish_scan_progress(self, text, kind):
+        self.progress.stop()
+        self.progress.pack_forget()
+        self._set_status(text, kind)
 
     def _handle_tk_exception(self, exc_type, exc_value, tb):
         app_log.error("Unhandled UI error: " + "".join(traceback.format_exception(exc_type, exc_value, tb)))
@@ -219,7 +256,10 @@ class LocalPatchApp:
     # ---------- Actions ----------
 
     def on_scan(self):
-        self._set_status("Scanning installed software and checking for updates...")
+        self.progress.configure(mode="indeterminate")
+        self.progress.pack(side="right", padx=10, pady=6)
+        self.progress.start(12)
+        self._set_status("Scanning installed software...")
         threading.Thread(target=self._scan_worker, daemon=True).start()
 
     def _scan_worker(self):
@@ -228,8 +268,17 @@ class LocalPatchApp:
             upgrades = {a["Id"]: a for a in scanner.scan_upgrades()}
 
             matcher = cve_matcher.CveMatcher(api_key=self.cfg.get("nvd_api_key") or None)
+            total = len(installed)
+            # Up to two throttled NVD requests per app (CPE lookup + CVE
+            # lookup) -- a conservative upper-bound estimate before any
+            # apps have actually been processed. Refined below as real
+            # per-app timing data comes in.
+            est_seconds = total * matcher.min_interval * 2
+            self.root.after(0, self.progress.stop)
+            self.root.after(0, lambda: self._start_scan_progress(total, est_seconds))
 
-            for pkg_id, app in installed.items():
+            start = time.time()
+            for i, (pkg_id, app) in enumerate(installed.items(), start=1):
                 available = upgrades.get(pkg_id, {}).get("Available")
                 state.upsert_app(
                     package_id=pkg_id, name=app["Name"], source=app.get("Source", ""),
@@ -238,12 +287,17 @@ class LocalPatchApp:
                 cves = matcher.lookup(app["Name"], app["Version"])
                 state.set_cves(pkg_id, cves)
 
+                elapsed = time.time() - start
+                remaining = (elapsed / i) * (total - i)  # adapts to observed per-app rate
+                self.root.after(0, lambda i=i, name=app["Name"], remaining=remaining:
+                                 self._update_scan_progress(i, total, name, remaining))
+
             app_log.info(f"Scan complete: {len(installed)} apps checked, {len(upgrades)} updates found.")
-            self.root.after(0, lambda: self._set_status(
+            self.root.after(0, lambda: self._finish_scan_progress(
                 f"Scan complete. {len(installed)} apps checked, {len(upgrades)} updates found.", "success"))
         except Exception as e:
             app_log.error(f"Scan failed: {e}\n{traceback.format_exc()}")
-            self.root.after(0, lambda: self._set_status(
+            self.root.after(0, lambda: self._finish_scan_progress(
                 "Scan failed — see View Logs > Status Log.", "error"))
         self.root.after(0, self.refresh_table)
 
