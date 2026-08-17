@@ -29,6 +29,8 @@ so the PowerShell call below does `$_.Status.ToString()`.
 
 import hashlib
 import json
+import os
+import re
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -118,6 +120,14 @@ def _expected_hash_from_manifest(manifest_path: Path, actual_sha256: str):
     return None, False
 
 
+_CHECK_SIGNATURE_SCRIPT = (
+    "Get-AuthenticodeSignature -FilePath $env:LP_SIG_PATH | "
+    "Select-Object @{N='Status';E={$_.Status.ToString()}}, StatusMessage, "
+    "@{N='SignerSubject';E={$_.SignerCertificate.Subject}} | "
+    "ConvertTo-Json -Compress"
+)
+
+
 def _check_signature(file_path: Path, trusted_publishers=None):
     """
     Runs Get-AuthenticodeSignature and returns (status, signer_subject,
@@ -126,16 +136,23 @@ def _check_signature(file_path: Path, trusted_publishers=None):
     the closest thing Get-AuthenticodeSignature offers to an "error code":
     the Status enum value IS the classification (NotSigned, HashMismatch,
     NotTrusted, etc.), and StatusMessage is its explanation.
+
+    SECURITY (2026-08-17 finding, fixed here): file_path ends up in the
+    installer filename winget derives from the manifest's InstallerUrl --
+    not something this process controls. A single quote is a legal Windows
+    filename character, so the earlier version of this function, which did
+    f"Get-AuthenticodeSignature -FilePath '{file_path}' | ...", could have
+    a crafted filename break out of the quoted string and inject arbitrary
+    PowerShell. Fixed the same way as notifier.py's toast injection: the
+    path is never spliced into script text at all -- it crosses the
+    process boundary as the LP_SIG_PATH environment variable and the
+    static script reads it via $env:LP_SIG_PATH, which PowerShell treats
+    as an opaque string value, not code to parse.
     """
-    ps_cmd = (
-        f"Get-AuthenticodeSignature -FilePath '{file_path}' | "
-        "Select-Object @{N='Status';E={$_.Status.ToString()}}, StatusMessage, "
-        "@{N='SignerSubject';E={$_.SignerCertificate.Subject}} | "
-        "ConvertTo-Json -Compress"
-    )
+    env = {**os.environ, "LP_SIG_PATH": str(file_path)}
     result = subprocess.run(
-        ["powershell", "-Command", ps_cmd],
-        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        ["powershell", "-Command", _CHECK_SIGNATURE_SCRIPT],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", env=env,
     )
     try:
         data = json.loads(result.stdout.strip())
@@ -157,44 +174,82 @@ def _check_signature(file_path: Path, trusted_publishers=None):
     return status, signer_subject, status_message
 
 
-def download_and_verify(package_id, version, config=None) -> VerificationResult:
-    """
-    Downloads `package_id`==`version` via `winget download`, then verifies
-    it against its own manifest (hash) and Get-AuthenticodeSignature
-    (signature). Falls back to manifest-only mode if `winget download`
-    fails outright (e.g. unsupported on this winget version/source).
+# Real winget PackageIdentifiers and versions only ever use letters,
+# digits, and a small set of separator punctuation -- examples actually
+# seen from `winget list`/`winget show`: "7zip.7zip",
+# "Microsoft.VisualStudioCode", "26.02", "1.2.3-beta". This is an
+# allowlist (not a "reject '..'" blocklist) deliberately: enumerating bad
+# substrings is easy to get wrong (encoded/alternate separators, etc.),
+# while "must look like a real winget identifier" is easy to get right and
+# still accepts everything real.
+_SAFE_CACHE_COMPONENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
 
-    `config` is the loaded config.json dict; relevant keys:
-      require_valid_signature (default True)
-      trusted_publishers: {package_id: [substrings]}
+
+def _validate_cache_components(package_id, version):
+    """
+    package_id and version both become path components under CACHE_ROOT
+    (CACHE_ROOT / package_id / version) in download_and_verify() below.
+    Neither is trustworthy input: package_id/version are whatever the
+    caller passed through (ultimately sourced from winget/NVD data), and
+    purge_expired() later os.unlink()s files by the path recorded from a
+    run like this -- so a package_id or version containing "..\\" or
+    "../" could escape CACHE_ROOT entirely and cause this tool to write
+    into, or delete, an arbitrary path outside its own cache directory.
+
+    Returns None if both components are safe to use as path segments, or
+    a VerificationResult(verified=False, ...) explaining the rejection if
+    either is not. Returning a result rather than raising keeps this
+    consistent with every other failure path in this module -- a
+    hostile/malformed package_id should surface as "verification failed"
+    to the caller, not crash the whole scan/deploy run.
+    """
+    for label, value in (("package_id", package_id), ("version", version)):
+        if not value or not _SAFE_CACHE_COMPONENT_RE.match(value):
+            return VerificationResult(
+                verified=False,
+                reason=(f"rejected: {label} {value!r} does not match the allowed pattern "
+                        f"({_SAFE_CACHE_COMPONENT_RE.pattern}) -- refusing to use it as a cache path"),
+            )
+    return None
+
+
+def _is_under_cache_root(target_dir: Path) -> bool:
+    """
+    Defense in depth on top of _validate_cache_components(): even if the
+    allowlist regex above has a gap, refuse to touch a resolved path that
+    isn't actually inside CACHE_ROOT.
+    """
+    try:
+        target_dir.resolve().relative_to(CACHE_ROOT.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def _verify_local_file(installer_path: Path, expected_sha256, config, package_id) -> VerificationResult:
+    """
+    Shared post-download verification: re-hashes `installer_path` and
+    checks its signature, then applies the same hash_match / signature_ok /
+    require_valid_signature decision logic download_and_verify() has always
+    used. Factored out so verify_and_record()'s "already verified, local
+    file still present" fast path (see P2 below) can independently re-check
+    the SAME local bytes every time -- skipping only the network fetch, not
+    any of the actual verification -- without duplicating this logic.
+
+    `expected_sha256` here is the previously-recorded manifest hash from
+    patch_cache, not a freshly re-fetched manifest -- the whole point of
+    the fast path is avoiding a network round-trip, so re-fetching the
+    manifest would defeat it. The local file is still independently
+    re-hashed and re-signature-checked, which is what actually matters for
+    security (a locally-tampered file is caught exactly the same way it
+    would be after a fresh download).
     """
     config = config or {}
     require_valid_signature = config.get("require_valid_signature", True)
     trusted_publishers = (config.get("trusted_publishers") or {}).get(package_id) or None
 
-    target_dir = CACHE_ROOT / package_id / version
-    target_dir.mkdir(parents=True, exist_ok=True)
-
-    ok, log = _run_winget_download(package_id, version, target_dir)
-    if not ok:
-        return _fallback_manifest_only(package_id, version, reason=f"winget download failed: {log.strip()[-500:]}")
-
-    installer_path, manifest_path = _find_download_files(target_dir)
-    if installer_path is None:
-        return _fallback_manifest_only(package_id, version, reason="winget download reported success but no installer file was found")
-
     actual_sha256 = _sha256_file(installer_path)
-
-    expected_sha256, hash_match = (None, False)
-    if manifest_path is not None:
-        expected_sha256, hash_match = _expected_hash_from_manifest(manifest_path, actual_sha256)
-    if expected_sha256 is None:
-        # No manifest, or manifest had multiple installers we couldn't match by hash.
-        return VerificationResult(
-            verified=False, reason="could not determine expected hash from manifest",
-            file_path=str(installer_path), actual_sha256=actual_sha256,
-            hash_match=False, verification_mode="full",
-        )
+    hash_match = bool(expected_sha256) and actual_sha256.lower() == expected_sha256.lower()
 
     signature_status, signer_subject, signature_message = _check_signature(installer_path, trusted_publishers)
     signature_ok = signature_status == "Valid"
@@ -224,13 +279,114 @@ def download_and_verify(package_id, version, config=None) -> VerificationResult:
     )
 
 
+def download_and_verify(package_id, version, config=None) -> VerificationResult:
+    """
+    Downloads `package_id`==`version` via `winget download`, then verifies
+    it against its own manifest (hash) and Get-AuthenticodeSignature
+    (signature). Falls back to manifest-only mode if `winget download`
+    fails outright (e.g. unsupported on this winget version/source).
+
+    `config` is the loaded config.json dict; relevant keys:
+      require_valid_signature (default True)
+      trusted_publishers: {package_id: [substrings]}
+    """
+    config = config or {}
+
+    invalid = _validate_cache_components(package_id, version)
+    if invalid is not None:
+        return invalid
+
+    target_dir = CACHE_ROOT / package_id / version
+    if not _is_under_cache_root(target_dir):
+        return VerificationResult(
+            verified=False,
+            reason=f"rejected: resolved cache path {target_dir} is not under CACHE_ROOT",
+        )
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    ok, log = _run_winget_download(package_id, version, target_dir)
+    if not ok:
+        return _fallback_manifest_only(package_id, version, config, reason=f"winget download failed: {log.strip()[-500:]}")
+
+    installer_path, manifest_path = _find_download_files(target_dir)
+    if installer_path is None:
+        return _fallback_manifest_only(package_id, version, config, reason="winget download reported success but no installer file was found")
+
+    actual_sha256 = _sha256_file(installer_path)
+
+    expected_sha256, hash_match = (None, False)
+    if manifest_path is not None:
+        expected_sha256, hash_match = _expected_hash_from_manifest(manifest_path, actual_sha256)
+    if expected_sha256 is None:
+        # No manifest, or manifest had multiple installers we couldn't match by hash.
+        return VerificationResult(
+            verified=False, reason="could not determine expected hash from manifest",
+            file_path=str(installer_path), actual_sha256=actual_sha256,
+            hash_match=False, verification_mode="full",
+        )
+
+    return _verify_local_file(installer_path, expected_sha256, config, package_id)
+
+
+def _fast_path_from_cache(package_id, version, config) -> VerificationResult | None:
+    """
+    If package_id+version was already verified in a prior run and its
+    cached installer file is still on disk, re-verify that SAME local file
+    (fresh hash + fresh signature check, no shortcuts on either) instead of
+    re-downloading. Returns None if there's nothing to reuse (not
+    previously verified, or the cached file has since been purged/moved),
+    in which case the caller falls through to a normal fresh download.
+
+    CONFIRMED empirically: `winget download` was run twice in a row for
+    the same already-present package+version and re-fetched the installer
+    both times (7.5s then 4.7s) -- winget itself has no skip-if-present
+    behavior. For a "Deploy All Eligible" batch of apps that were already
+    verified in an earlier run, that's pure waste: re-hashing the LOCAL
+    file catches tampering exactly as well as a fresh download would,
+    since the file's bytes are what actually get installed either way.
+    Only the network fetch is skipped here -- the hash and signature are
+    still independently re-checked against the local bytes every time.
+    """
+    if not state.is_patch_verified(package_id, version):
+        return None
+
+    entries = [
+        e for e in state.get_patch_cache_entries()
+        if e["package_id"] == package_id and e["version"] == version
+    ]
+    if not entries:
+        return None
+
+    cached_file_path = entries[0].get("file_path")
+    cached_expected_sha256 = entries[0].get("expected_sha256")
+    if not cached_file_path:
+        return None
+
+    installer_path = Path(cached_file_path)
+    if not installer_path.exists():
+        return None  # purged by retention policy or otherwise missing -- fall through
+
+    return _verify_local_file(installer_path, cached_expected_sha256, config, package_id)
+
+
 def verify_and_record(package_id, version, config=None) -> VerificationResult:
     """
     download_and_verify(), then unconditionally records the result to the
     patch_cache table (pass or fail) so there's an audit trail of every
     attempted download. This is the entry point deploy flows should call.
+
+    Before downloading, checks whether this exact package_id+version was
+    already verified in a prior run and its cached file is still present
+    on disk -- see _fast_path_from_cache(). If so, skips the network
+    fetch and re-verifies the local file directly, which is materially
+    faster (a `winget download` re-fetch costs several seconds to tens of
+    seconds depending on installer size, confirmed empirically at 7.5s and
+    4.7s for repeat downloads of the same file) with no reduction in
+    security guarantees, since the local bytes are independently re-hashed
+    and re-signature-checked either way.
     """
-    result = download_and_verify(package_id, version, config)
+    cached_result = _fast_path_from_cache(package_id, version, config)
+    result = cached_result if cached_result is not None else download_and_verify(package_id, version, config)
     state.record_patch_download(
         package_id=package_id, version=version, file_path=result.file_path,
         expected_sha256=result.expected_sha256, actual_sha256=result.actual_sha256,
@@ -241,14 +397,45 @@ def verify_and_record(package_id, version, config=None) -> VerificationResult:
     return result
 
 
-def _fallback_manifest_only(package_id, version, reason) -> VerificationResult:
+def _fallback_manifest_only(package_id, version, config, reason) -> VerificationResult:
     """
-    winget download didn't work — trust winget's own internal hash check
-    (which `winget upgrade` also performs) instead of independently
-    re-downloading and re-hashing. Weaker guarantee; clearly labeled as
-    such via verification_mode so it's never misrepresented as a full
-    independent verification.
+    winget download didn't work — the only fallback left is to trust
+    winget's own internal hash check (the same one `winget upgrade`
+    performs) instead of independently downloading and re-hashing a file
+    ourselves. This is a materially weaker guarantee than "full" mode: no
+    file is downloaded here, no hash is independently computed, and no
+    signature is checked -- this function only greps text out of
+    `winget show`. It is clearly labeled as such via verification_mode.
+
+    SECURITY (2026-08-17 finding, fixed here): this used to
+    unconditionally return verified=True (with a hardcoded, and simply
+    false, hash_match=True -- nothing was ever compared) whenever
+    `winget show` merely reported *a* hash string. Callers only checked
+    `result.verified`, so a source that couldn't be independently
+    verified at all looked identical, from the caller's perspective, to
+    one that had passed a full hash+signature check. Fixed two ways:
+
+    1. Gated behind config["allow_manifest_only_verification"], which
+       DEFAULTS TO FALSE. With the default, a failed `winget download`
+       now blocks deployment outright (verified=False) rather than
+       silently downgrading to a weaker check the operator never opted
+       into.
+    2. Even when explicitly enabled, hash_match is no longer hardcoded
+       True -- it's False, because no actual downloaded file was ever
+       hashed and compared here. verification_mode stays "manifest-only"
+       so gui.py can (and does, see _verification_label) show this
+       distinctly from a real "Verified".
     """
+    config = config or {}
+    if not config.get("allow_manifest_only_verification", False):
+        return VerificationResult(
+            verified=False,
+            reason=(f"{reason}; manifest-only verification is disabled "
+                    f"(allow_manifest_only_verification=false) -- blocking rather than "
+                    f"falling back to a weaker, unverified-download check"),
+            verification_mode="manifest-only",
+        )
+
     ok, show_output = _run_winget_show(package_id, version)
     if not ok:
         return VerificationResult(
@@ -272,8 +459,10 @@ def _fallback_manifest_only(package_id, version, reason) -> VerificationResult:
 
     return VerificationResult(
         verified=True,
-        reason=f"{reason}; trusting winget's own manifest-reported hash (not independently re-verified)",
-        expected_sha256=sha_match, hash_match=True,
+        reason=(f"{reason}; allow_manifest_only_verification is true -- trusting winget's own "
+                f"manifest-reported hash, not independently re-verified (no file was downloaded "
+                f"or hashed by this process)"),
+        expected_sha256=sha_match, hash_match=False,
         signature_status="NotChecked", verification_mode="manifest-only",
     )
 
