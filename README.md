@@ -25,7 +25,13 @@ after a configurable "burn-in" delay.
 
 ## Screenshots
 
-<!-- TODO: add real screenshots of the GUI here after running it -->
+**Dashboard** — real scan of ~200 installed applications, cross-referenced against NVD:
+
+![LocalPatch dashboard](docs/screenshots/dashboard.png)
+
+**Settings** — scan schedule, NVD API key, and verification policy:
+
+![LocalPatch settings](docs/screenshots/settings.png)
 
 ## Requirements
 
