@@ -255,6 +255,8 @@ class LocalPatchApp:
                    command=self.on_deploy_selected).pack(side="left")
         ttk.Button(bar, text="Deploy All Eligible", cursor="hand2",
                    command=self.on_deploy_eligible).pack(side="left", padx=(SPACE["sm"], 0))
+        ttk.Button(bar, text="Deploy All Shown", cursor="hand2",
+                   command=self.on_deploy_all_shown).pack(side="left", padx=(SPACE["sm"], 0))
 
         ttk.Button(bar, text="Settings", cursor="hand2", command=self.on_settings).pack(side="right")
 
@@ -596,6 +598,44 @@ class LocalPatchApp:
                 "Some updates excluded",
                 "These apps previously failed verification and are excluded from "
                 "Deploy All Eligible — review them individually via View Verification Log:\n\n"
+                + "\n".join(blocked),
+            )
+        if not deployable:
+            return
+        self._deploy_many(deployable)
+
+    def on_deploy_all_shown(self):
+        """
+        Deploys every app currently in the table -- i.e. everything with a
+        pending update, regardless of the delay-window burn-in period.
+        Equivalent to selecting every row and hitting Deploy Selected (which
+        already bypasses the delay for manually-picked apps), just in one
+        click instead of many. 'Deploy All Eligible' is untouched and still
+        respects the delay window.
+        """
+        shown_ids = list(self.tree.get_children())
+        if not shown_ids:
+            messagebox.showinfo("LocalPatch", "No apps with a pending update to deploy.")
+            return
+
+        apps_by_id = {a["package_id"]: a for a in state.get_all_apps()}
+        cache = {(e["package_id"], e["version"]): e for e in state.get_patch_cache_entries()}
+        deployable, blocked = [], []
+        for pkg_id in shown_ids:
+            app = apps_by_id.get(pkg_id)
+            if not app:
+                continue
+            entry = cache.get((pkg_id, app["available_version"]))
+            if entry and not entry["verified"]:
+                blocked.append(app["name"])
+            else:
+                deployable.append(pkg_id)
+
+        if blocked:
+            messagebox.showwarning(
+                "Some updates excluded",
+                "These apps previously failed verification and are excluded from "
+                "Deploy All Shown — review them individually via View Verification Log:\n\n"
                 + "\n".join(blocked),
             )
         if not deployable:
