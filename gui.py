@@ -73,6 +73,8 @@ class LocalPatchApp:
         self.root.geometry("1040x600")
         self.root.minsize(860, 440)
         self.cfg = load_config()
+        self._scan_active = False
+        self._scan_cancel_event = None
 
         self._apply_theme()
         self._build_toolbar()
@@ -156,7 +158,13 @@ class LocalPatchApp:
         bar = ttk.Frame(self.root, padding=10)
         bar.pack(fill="x")
 
-        ttk.Button(bar, text="Scan Now", style="Accent.TButton", command=self.on_scan).pack(side="left", padx=(0, 6))
+        self.scan_button = ttk.Button(bar, text="Scan Now", style="Accent.TButton", command=self.on_scan)
+        self.scan_button.pack(side="left", padx=(0, 6))
+
+        self.stop_scan_button = ttk.Button(bar, text="Stop Scan", command=self.on_stop_scan)
+        self.stop_scan_button.state(["disabled"])
+        self.stop_scan_button.pack(side="left", padx=6)
+
         ttk.Button(bar, text="Deploy Selected", command=self.on_deploy_selected).pack(side="left", padx=6)
         ttk.Button(bar, text="Deploy All Eligible", command=self.on_deploy_eligible).pack(side="left", padx=6)
 
@@ -256,13 +264,35 @@ class LocalPatchApp:
     # ---------- Actions ----------
 
     def on_scan(self):
+        if self._scan_active:
+            return
+        self._scan_active = True
+        self._scan_cancel_event = threading.Event()
+        self.scan_button.state(["disabled"])
+        self.stop_scan_button.state(["!disabled"])
+
         self.progress.configure(mode="indeterminate")
         self.progress.pack(side="right", padx=10, pady=6)
         self.progress.start(12)
         self._set_status("Scanning installed software...")
-        threading.Thread(target=self._scan_worker, daemon=True).start()
+        threading.Thread(target=self._scan_worker, args=(self._scan_cancel_event,), daemon=True).start()
 
-    def _scan_worker(self):
+    def on_stop_scan(self):
+        if self._scan_cancel_event is not None:
+            self._scan_cancel_event.set()
+            self.stop_scan_button.state(["disabled"])
+            self._set_status("Stopping scan... (finishing the app currently being checked)")
+
+    def _reset_scan_buttons(self):
+        self._scan_active = False
+        self._scan_cancel_event = None
+        self.scan_button.state(["!disabled"])
+        self.stop_scan_button.state(["disabled"])
+
+    def _scan_worker(self, cancel_event):
+        cancelled = False
+        checked = 0
+        total = 0
         try:
             installed = {a["Id"]: a for a in scanner.scan_installed()}
             upgrades = {a["Id"]: a for a in scanner.scan_upgrades()}
@@ -279,6 +309,13 @@ class LocalPatchApp:
 
             start = time.time()
             for i, (pkg_id, app) in enumerate(installed.items(), start=1):
+                # Checked once per app rather than mid-NVD-request -- Stop
+                # takes effect after the app currently being checked
+                # finishes (up to ~13s without an API key), not instantly.
+                if cancel_event.is_set():
+                    cancelled = True
+                    break
+
                 available = upgrades.get(pkg_id, {}).get("Available")
                 state.upsert_app(
                     package_id=pkg_id, name=app["Name"], source=app.get("Source", ""),
@@ -286,19 +323,26 @@ class LocalPatchApp:
                 )
                 cves = matcher.lookup(app["Name"], app["Version"])
                 state.set_cves(pkg_id, cves)
+                checked = i
 
                 elapsed = time.time() - start
                 remaining = (elapsed / i) * (total - i)  # adapts to observed per-app rate
                 self.root.after(0, lambda i=i, name=app["Name"], remaining=remaining:
                                  self._update_scan_progress(i, total, name, remaining))
 
-            app_log.info(f"Scan complete: {len(installed)} apps checked, {len(upgrades)} updates found.")
-            self.root.after(0, lambda: self._finish_scan_progress(
-                f"Scan complete. {len(installed)} apps checked, {len(upgrades)} updates found.", "success"))
+            if cancelled:
+                app_log.warning(f"Scan stopped by user after {checked}/{total} apps.")
+                self.root.after(0, lambda: self._finish_scan_progress(
+                    f"Scan stopped. {checked}/{total} apps checked before stopping.", "info"))
+            else:
+                app_log.info(f"Scan complete: {len(installed)} apps checked, {len(upgrades)} updates found.")
+                self.root.after(0, lambda: self._finish_scan_progress(
+                    f"Scan complete. {len(installed)} apps checked, {len(upgrades)} updates found.", "success"))
         except Exception as e:
             app_log.error(f"Scan failed: {e}\n{traceback.format_exc()}")
             self.root.after(0, lambda: self._finish_scan_progress(
                 "Scan failed — see View Logs > Status Log.", "error"))
+        self.root.after(0, self._reset_scan_buttons)
         self.root.after(0, self.refresh_table)
 
     def on_deploy_selected(self):
