@@ -720,6 +720,14 @@ class LocalPatchApp:
         auto_var = tk.BooleanVar(value=self.cfg["auto_run_enabled"])
         ttk.Checkbutton(schedule_frame, text="Enable automatic daily scan + deploy",
                          variable=auto_var).pack(anchor="w")
+        tk.Label(
+            schedule_frame,
+            text="Runs elevated so the daily run installs updates without a UAC prompt. "
+                 "Toggling this asks for administrator approval once, here — manual "
+                 "Deploy clicks in this window still prompt, as expected.",
+            font=("Segoe UI", 8), wraplength=340, justify="left",
+            background=COLORS["bg"], foreground=COLORS["muted"],
+        ).pack(anchor="w", pady=(SPACE["xs"], 0))
 
         security_frame = ttk.LabelFrame(container, text="Security & Verification", padding=SPACE["md"])
         security_frame.pack(fill="x", pady=(0, SPACE["md"]))

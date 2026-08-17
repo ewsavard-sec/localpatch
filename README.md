@@ -73,6 +73,18 @@ python main.py --setup-schedule
 python main.py --remove-schedule
 ```
 
+The task is created with `/RL HIGHEST`, so the daily unattended run
+installs updates without a UAC prompt — Task Scheduler only asks for
+interactive consent when a task is *authorized* to run elevated, not every
+time an already-authorized task fires. Since authorizing that is itself a
+privileged action, toggling this setting elevates just that one `schtasks`
+call (one UAC prompt, once, in Settings) rather than requiring the whole
+LocalPatch GUI to run as Administrator. Manual "Deploy Selected"/"Deploy
+All..." clicks in the GUI are unaffected and still prompt for UAC when
+winget needs elevation — that's correct, since those are you interactively
+triggering an admin action, which is exactly what UAC exists to gate.
+This app does not disable UAC or suppress its prompts in any other way.
+
 ## How the delay window works
 
 The burn-in delay is anchored to when a patch **actually shipped**, not
