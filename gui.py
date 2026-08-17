@@ -88,8 +88,8 @@ class LocalPatchApp:
     def __init__(self, root):
         self.root = root
         self.root.title("LocalPatch")
-        self.root.geometry("1100x680")
-        self.root.minsize(920, 480)
+        self.root.geometry("1100x760")
+        self.root.minsize(920, 560)
         self.cfg = load_config()
         self._scan_active = False
         self._scan_cancel_event = None
@@ -99,6 +99,7 @@ class LocalPatchApp:
         self._apply_theme()
         self._build_header()
         self._build_toolbar()
+        self._build_dashboard()
         self._build_table()
         self._build_statusbar()
 
@@ -264,6 +265,132 @@ class LocalPatchApp:
         logs_menu.add_command(label="Status Log (all events)", command=self.on_view_status_log)
         ttk.Menubutton(bar, text="View Logs", menu=logs_menu, cursor="hand2").pack(
             side="right", padx=(0, SPACE["sm"]))
+
+    def _build_dashboard(self):
+        """
+        A row of summary cards above the applications table -- the
+        dashboard-first layout, adapted from a network vulnerability
+        console's style. LocalPatch tracks one machine, not a fleet, so
+        this reports on the whole local inventory (not just apps with a
+        pending update, which is what the table below filters to) rather
+        than a per-computer breakdown. No chart widgets -- colored status
+        rows only, in the same spirit as the reference's category list.
+        """
+        row = ttk.Frame(self.root, padding=(SPACE["lg"], 0, SPACE["lg"], SPACE["lg"]))
+        row.pack(fill="x")
+        row.columnconfigure(0, weight=1, uniform="card")
+        row.columnconfigure(1, weight=1, uniform="card")
+        row.columnconfigure(2, weight=1, uniform="card")
+
+        self.status_card = self._make_card(row, "Update Status")
+        self.status_card.grid(row=0, column=0, sticky="nsew", padx=(0, SPACE["sm"]))
+
+        self.severity_card = self._make_card(row, "Vulnerability Severity")
+        self.severity_card.grid(row=0, column=1, sticky="nsew", padx=SPACE["sm"])
+
+        self.risk_card = self._make_card(row, "Most At-Risk Applications")
+        self.risk_card.grid(row=0, column=2, sticky="nsew", padx=(SPACE["sm"], 0))
+
+    @staticmethod
+    def _make_card(parent, title):
+        card = tk.Frame(parent, background=COLORS["surface"],
+                         highlightbackground=COLORS["border"], highlightthickness=1, bd=0)
+        tk.Label(card, text=title.upper(), font=FONT_STAT_LABEL,
+                 background=COLORS["surface"], foreground=COLORS["muted"]).pack(
+            anchor="w", padx=SPACE["md"], pady=(SPACE["md"], SPACE["sm"]))
+        body = tk.Frame(card, background=COLORS["surface"])
+        body.pack(fill="both", expand=True, padx=SPACE["md"], pady=(0, SPACE["md"]))
+        card.body = body
+        return card
+
+    @staticmethod
+    def _dashboard_row(parent, count, label):
+        color = COLORS["muted"] if count == 0 else COLORS["danger"]
+        line = tk.Frame(parent, background=COLORS["surface"])
+        line.pack(fill="x", pady=2)
+        tk.Label(line, text="●", font=FONT_UI, background=COLORS["surface"],
+                 foreground=color).pack(side="left")
+        tk.Label(line, text=str(count), font=FONT_UI_BOLD, width=3, anchor="w",
+                 background=COLORS["surface"], foreground=COLORS["text"]).pack(
+            side="left", padx=(SPACE["xs"], SPACE["xs"]))
+        tk.Label(line, text=label, font=FONT_UI, background=COLORS["surface"],
+                 foreground=COLORS["muted"]).pack(side="left")
+
+    def _empty_card_note(self, parent, text):
+        tk.Label(parent, text=text, font=FONT_UI, background=COLORS["surface"],
+                 foreground=COLORS["muted"], wraplength=240, justify="left").pack(
+            anchor="w", pady=SPACE["xs"])
+
+    def refresh_dashboard(self):
+        for card in (self.status_card, self.severity_card, self.risk_card):
+            for child in card.body.winfo_children():
+                child.destroy()
+
+        apps = state.get_all_apps()
+        cache_entries = state.get_patch_cache_entries()
+
+        def cves_of(app):
+            return json.loads(app["cves"] or "[]")
+
+        pending = [a for a in apps if a["available_version"] and a["available_version"] != a["installed_version"]]
+        severity_counts = {}
+        critical_apps, high_apps = set(), set()
+        for a in apps:
+            for c in cves_of(a):
+                sev = c.get("severity") or "UNKNOWN"
+                severity_counts[sev] = severity_counts.get(sev, 0) + 1
+                if sev == "CRITICAL":
+                    critical_apps.add(a["package_id"])
+                elif sev == "HIGH":
+                    high_apps.add(a["package_id"])
+
+        verify_failed = sum(1 for e in cache_entries if not e["verified"])
+        deploy_failed = sum(1 for a in apps if a["deploy_status"] == "failed")
+
+        # --- Update Status ---
+        self._dashboard_row(self.status_card.body, len(pending), "Pending Updates")
+        self._dashboard_row(self.status_card.body, len(critical_apps), "Apps with Critical CVEs")
+        self._dashboard_row(self.status_card.body, len(high_apps), "Apps with High CVEs")
+        self._dashboard_row(self.status_card.body, verify_failed, "Verification Failures")
+        self._dashboard_row(self.status_card.body, deploy_failed, "Deploy Failures")
+
+        # --- Vulnerability Severity ---
+        sev_order = [("CRITICAL", "Critical"), ("HIGH", "High"), ("MEDIUM", "Medium"),
+                     ("LOW", "Low"), ("UNKNOWN", "Unknown")]
+        if not severity_counts:
+            self._empty_card_note(self.severity_card.body, "No known CVEs across your current inventory.")
+        else:
+            for key, label in sev_order:
+                if severity_counts.get(key):
+                    self._dashboard_row(self.severity_card.body, severity_counts[key], f"{label} CVEs")
+
+        # --- Most At-Risk Applications ---
+        def risk_key(a):
+            cves = cves_of(a)
+            crit = sum(1 for c in cves if c.get("severity") == "CRITICAL")
+            high = sum(1 for c in cves if c.get("severity") == "HIGH")
+            return (-crit, -high, -len(cves))
+
+        top_risk = [a for a in apps if cves_of(a)]
+        top_risk.sort(key=risk_key)
+        top_risk = top_risk[:5]
+
+        if not top_risk:
+            self._empty_card_note(self.risk_card.body, "No apps with known CVEs.")
+        else:
+            for a in top_risk:
+                cves = cves_of(a)
+                sevs = {c.get("severity") for c in cves}
+                color = COLORS["danger"] if "CRITICAL" in sevs else \
+                    COLORS["warning"] if "HIGH" in sevs else COLORS["muted"]
+                line = tk.Frame(self.risk_card.body, background=COLORS["surface"])
+                line.pack(fill="x", pady=2)
+                tk.Label(line, text="●", font=FONT_UI, background=COLORS["surface"],
+                         foreground=color).pack(side="left")
+                tk.Label(line, text=a["name"], font=FONT_UI, background=COLORS["surface"],
+                         foreground=COLORS["text"]).pack(side="left", padx=(SPACE["xs"], SPACE["sm"]))
+                tk.Label(line, text=f"{len(cves)} CVE{'s' if len(cves) != 1 else ''}", font=FONT_UI,
+                         background=COLORS["surface"], foreground=COLORS["muted"]).pack(side="right")
 
     def _build_table(self):
         table_frame = ttk.Frame(self.root)
@@ -834,6 +961,8 @@ class LocalPatchApp:
             if self.tree.exists(iid):
                 self.tree.selection_add(iid)
         self.tree.yview_moveto(scroll_pos[0])
+
+        self.refresh_dashboard()
 
     def _days_left(self, app):
         if not app["first_seen_available"]:
