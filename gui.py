@@ -442,20 +442,33 @@ class LocalPatchApp:
         bar.pack(fill="x", side="bottom")
 
         self.progress = ttk.Progressbar(bar, orient="horizontal", length=220, mode="determinate")
-        # Not packed here -- only shown while a scan is running (see
-        # _start_scan_progress / _finish_scan_progress).
+        # Not packed here -- only shown while a scan/deploy is running (see
+        # _start_scan_progress/_start_deploy_progress and _finish_progress).
+
+        text_box = tk.Frame(bar, background=COLORS["surface_alt"])
+        text_box.pack(side="left", fill="x", expand=True, padx=SPACE["md"], pady=(SPACE["xs"], SPACE["xs"]))
 
         self.status_var = tk.StringVar(value="Ready.")
         self.status_label = tk.Label(
-            bar, textvariable=self.status_var, anchor="w", padx=SPACE["md"], pady=SPACE["sm"],
+            text_box, textvariable=self.status_var, anchor="w",
             background=COLORS["surface_alt"], foreground=COLORS["muted"], font=FONT_UI,
         )
-        self.status_label.pack(side="left", fill="x", expand=True)
+        self.status_label.pack(anchor="w", fill="x")
 
-    def _set_status(self, text, kind="info"):
+        # Secondary line -- patch progress count, start time, elapsed, etc.
+        # Blank and takes no visible space when there's nothing to show.
+        self.status_detail_var = tk.StringVar(value="")
+        self.status_detail_label = tk.Label(
+            text_box, textvariable=self.status_detail_var, anchor="w",
+            background=COLORS["surface_alt"], foreground=COLORS["muted"], font=("Segoe UI", 8),
+        )
+        self.status_detail_label.pack(anchor="w", fill="x")
+
+    def _set_status(self, text, kind="info", detail=""):
         color = {"info": COLORS["muted"], "success": COLORS["accent"], "error": COLORS["danger"]}.get(kind, COLORS["muted"])
         self.status_var.set(text)
         self.status_label.configure(foreground=color)
+        self.status_detail_var.set(detail)
 
     @staticmethod
     def _format_duration(seconds):
@@ -480,10 +493,22 @@ class LocalPatchApp:
         self.progress.configure(value=i)
         self._set_status(f"Scanning {i}/{total}: {name}... ~{self._format_duration(remaining_seconds)} remaining")
 
-    def _finish_scan_progress(self, text, kind):
+    def _start_deploy_progress(self, total):
+        self.progress.configure(mode="determinate", maximum=total, value=0)
+        self.progress.pack(side="right", padx=SPACE["md"], pady=SPACE["sm"])
+
+    def _update_deploy_progress(self, i, total, name, version, phase, started_at, elapsed):
+        self.progress.configure(value=i - 1 + (0.5 if phase == "installing" else 0))
+        verb = "Verifying" if phase == "verifying" else "Installing"
+        self._set_status(
+            f"{verb} {name} ({version})...",
+            detail=f"Patch {i} of {total}  •  Started {started_at}  •  Elapsed {self._format_duration(elapsed)}",
+        )
+
+    def _finish_progress(self, text, kind, detail=""):
         self.progress.stop()
         self.progress.pack_forget()
-        self._set_status(text, kind)
+        self._set_status(text, kind, detail)
 
     def _handle_tk_exception(self, exc_type, exc_value, tb):
         app_log.error("Unhandled UI error: " + "".join(traceback.format_exception(exc_type, exc_value, tb)))
@@ -575,15 +600,15 @@ class LocalPatchApp:
 
             if cancelled:
                 app_log.warning(f"Scan stopped by user after {checked}/{total} apps.")
-                self.root.after(0, lambda: self._finish_scan_progress(
+                self.root.after(0, lambda: self._finish_progress(
                     f"Scan stopped. {checked}/{total} apps checked before stopping.", "info"))
             else:
                 app_log.info(f"Scan complete: {len(installed)} apps checked, {len(upgrades)} updates found.")
-                self.root.after(0, lambda: self._finish_scan_progress(
+                self.root.after(0, lambda: self._finish_progress(
                     f"Scan complete. {len(installed)} apps checked, {len(upgrades)} updates found.", "success"))
         except Exception as e:
             app_log.error(f"Scan failed: {e}\n{traceback.format_exc()}")
-            self.root.after(0, lambda: self._finish_scan_progress(
+            self.root.after(0, lambda: self._finish_progress(
                 "Scan failed — see View Logs > Status Log.", "error"))
         self.root.after(0, self._reset_scan_buttons)
         self.root.after(0, self.refresh_table)
@@ -661,6 +686,7 @@ class LocalPatchApp:
             return
         if not messagebox.askyesno("Confirm Deployment", f"Deploy {len(iids)} update(s) now?"):
             return
+        self.root.after(0, lambda: self._start_deploy_progress(len(iids)))
         self._set_status(f"Deploying {len(iids)} update(s)...")
         threading.Thread(target=self._deploy_worker, args=(iids,), daemon=True).start()
 
@@ -669,16 +695,42 @@ class LocalPatchApp:
         blocked = 0
         failed = 0
         deployed = 0
-        for pkg_id in package_ids:
+        total = len(package_ids)
+        start = time.time()
+        started_at = time.strftime("%H:%M:%S", time.localtime(start))
+
+        for i, pkg_id in enumerate(package_ids, start=1):
             version = apps_by_id.get(pkg_id, {}).get("available_version", "unknown")
             name = apps_by_id.get(pkg_id, {}).get("name", pkg_id)
+
+            # "In Progress" in the Status column from the moment this app
+            # starts, not just once it's done -- and refresh right away so
+            # it's visible before the (potentially slow) verify/install work
+            # even begins.
+            state.mark_deploying(pkg_id)
+            self.root.after(0, lambda i=i, name=name, version=version:
+                             self._update_deploy_progress(i, total, name, version, "verifying",
+                                                           started_at, time.time() - start))
+            self.root.after(0, self.refresh_table)
+
             try:
                 result = patch_store.verify_and_record(pkg_id, version, self.cfg)
+                # Verification column updates the instant the result is
+                # known, independent of whether the install step (next)
+                # even runs.
+                self.root.after(0, self.refresh_table)
+
                 if not result.verified:
                     state.mark_deployed(pkg_id, version, success=False)
                     app_log.warning(f"Blocked deploy: {name} {version} -- {result.reason}")
                     blocked += 1
+                    self.root.after(0, self.refresh_table)
                     continue
+
+                self.root.after(0, lambda i=i, name=name, version=version:
+                                 self._update_deploy_progress(i, total, name, version, "installing",
+                                                               started_at, time.time() - start))
+
                 success, log = deployer.deploy(pkg_id)
                 state.mark_deployed(pkg_id, version, success)
                 if success:
@@ -692,6 +744,9 @@ class LocalPatchApp:
                 app_log.error(f"Unexpected error deploying {name} {version}: {e}\n{traceback.format_exc()}")
                 failed += 1
 
+            self.root.after(0, self.refresh_table)
+
+        elapsed_total = self._format_duration(time.time() - start)
         summary = f"Deployment finished. {deployed} deployed."
         kind = "success"
         extras = []
@@ -702,7 +757,8 @@ class LocalPatchApp:
             kind = "error"
         if extras:
             summary += " " + ", ".join(extras) + " — see View Logs > Status Log."
-        self.root.after(0, lambda: self._set_status(summary, kind))
+        detail = f"{total} patch{'es' if total != 1 else ''} scanned  •  Started {started_at}  •  Elapsed {elapsed_total}"
+        self.root.after(0, lambda: self._finish_progress(summary, kind, detail))
         self.root.after(0, self.refresh_table)
 
     def on_settings(self):
@@ -922,6 +978,17 @@ class LocalPatchApp:
             return "Failed — hash mismatch", True
         return "Failed — unsigned", True
 
+    _STATUS_LABELS = {
+        "idle": "-",
+        "deploying": "In Progress",
+        "deployed": "Complete",
+        "failed": "Failed",
+    }
+
+    @classmethod
+    def _status_label(cls, deploy_status):
+        return cls._STATUS_LABELS.get(deploy_status, deploy_status)
+
     def _sort_by(self, col):
         if self._sort_state["column"] == col:
             self._sort_state["reverse"] = not self._sort_state["reverse"]
@@ -999,7 +1066,7 @@ class LocalPatchApp:
                 "cves": cve_text,
                 "_cve_count": len(cves),
                 "verification": verification_label,
-                "status": app["deploy_status"],
+                "status": self._status_label(app["deploy_status"]),
                 "_sev_tag": sev_tag,
                 "_verify_failed": verify_failed,
             })

@@ -147,6 +147,18 @@ def set_cves(package_id, cve_list):
         )
 
 
+def mark_deploying(package_id):
+    """
+    Sets deploy_status='deploying' -- an intermediate state shown as "In
+    Progress" in the GUI while an app is being verified/installed, distinct
+    from the terminal 'deployed'/'failed' states mark_deployed() sets.
+    Doesn't touch last_deployed_version/last_deployed_at, which should only
+    change on a terminal outcome.
+    """
+    with get_conn() as conn:
+        conn.execute("UPDATE apps SET deploy_status='deploying' WHERE package_id=?", (package_id,))
+
+
 def mark_deployed(package_id, version, success=True):
     now = time.strftime("%Y-%m-%dT%H:%M:%S")
     with get_conn() as conn:

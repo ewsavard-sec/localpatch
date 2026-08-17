@@ -57,6 +57,25 @@ def test_delay_window_not_yet_eligible(isolated_env):
     assert state.get_eligible_for_autodeploy(delay_days=7) == []
 
 
+def test_mark_deploying_sets_intermediate_status(isolated_env):
+    state.upsert_app("pkg.g", "Pkg G", "winget", "1.0", "2.0")
+    state.mark_deploying("pkg.g")
+
+    row = state.get_all_apps()[0]
+    assert row["deploy_status"] == "deploying"
+    assert row["last_deployed_version"] is None  # not touched by mark_deploying
+
+
+def test_mark_deploying_then_mark_deployed_reaches_terminal_state(isolated_env):
+    state.upsert_app("pkg.h", "Pkg H", "winget", "1.0", "2.0")
+    state.mark_deploying("pkg.h")
+    state.mark_deployed("pkg.h", "2.0", success=True)
+
+    row = state.get_all_apps()[0]
+    assert row["deploy_status"] == "deployed"
+    assert row["last_deployed_version"] == "2.0"
+
+
 def test_delay_window_skips_already_deployed_version(isolated_env):
     state.upsert_app("pkg.c", "Pkg C", "winget", "1.0", "2.0")
     with state.get_conn() as conn:
