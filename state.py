@@ -57,11 +57,26 @@ _PATCH_CACHE_MIGRATIONS = [
 ]
 
 
+def _ensure_schema(conn):
+    conn.executescript(SCHEMA)
+    existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(patch_cache)").fetchall()}
+    for col, coltype in _PATCH_CACHE_MIGRATIONS:
+        if col not in existing_cols:
+            conn.execute(f"ALTER TABLE patch_cache ADD COLUMN {col} {coltype}")
+
+
 @contextmanager
 def get_conn():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     try:
+        # Self-healing: if localpatch.db is missing, gets deleted out from
+        # under a running process, or is a fresh empty file, sqlite3.connect
+        # silently creates/opens an empty database with no tables -- every
+        # connection re-applies the (idempotent, CREATE TABLE IF NOT EXISTS)
+        # schema rather than assuming init_db() ran once at startup and
+        # nothing has touched the file since.
+        _ensure_schema(conn)
         yield conn
         conn.commit()
     finally:
@@ -69,12 +84,8 @@ def get_conn():
 
 
 def init_db():
-    with get_conn() as conn:
-        conn.executescript(SCHEMA)
-        existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(patch_cache)").fetchall()}
-        for col, coltype in _PATCH_CACHE_MIGRATIONS:
-            if col not in existing_cols:
-                conn.execute(f"ALTER TABLE patch_cache ADD COLUMN {col} {coltype}")
+    with get_conn():
+        pass  # get_conn() ensures the schema on every connection now
 
 
 def upsert_app(package_id, name, source, installed_version, available_version):
