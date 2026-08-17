@@ -13,6 +13,7 @@ Usage:
 
 import argparse
 import json
+import traceback
 from pathlib import Path
 
 import state
@@ -21,6 +22,7 @@ import cve_matcher
 import deployer
 import scheduler
 import patch_store
+import app_log
 
 CONFIG_PATH = Path(__file__).parent / "config.json"
 CONFIG_EXAMPLE_PATH = Path(__file__).parent / "config.example.json"
@@ -66,14 +68,25 @@ def run_auto(cfg):
     print(f"{len(eligible)} update(s) past the {cfg['delay_days']}-day delay window.")
     for app in eligible:
         package_id, version = app["package_id"], app["available_version"]
-        result = patch_store.verify_and_record(package_id, version, cfg)
-        if not result.verified:
+        name = app["name"]
+        try:
+            result = patch_store.verify_and_record(package_id, version, cfg)
+            if not result.verified:
+                state.mark_deployed(package_id, version, success=False)
+                app_log.warning(f"Blocked deploy: {name} {version} -- {result.reason}")
+                print(f"  {name}: BLOCKED — failed verification ({result.reason})")
+                continue
+            success, log = deployer.deploy(package_id)
+            state.mark_deployed(package_id, version, success)
+            if success:
+                app_log.info(f"Deployed: {name} {version}")
+            else:
+                app_log.error(f"Deploy failed: {name} {version} -- winget output: {log.strip()[-1000:]}")
+            print(f"  {name}: {'OK' if success else 'FAILED'}")
+        except Exception as e:
             state.mark_deployed(package_id, version, success=False)
-            print(f"  {app['name']}: BLOCKED — failed verification ({result.reason})")
-            continue
-        success, log = deployer.deploy(package_id)
-        state.mark_deployed(package_id, version, success)
-        print(f"  {app['name']}: {'OK' if success else 'FAILED'}")
+            app_log.error(f"Unexpected error deploying {name} {version}: {e}\n{traceback.format_exc()}")
+            print(f"  {name}: ERROR — {e} (see localpatch.log)")
 
     run_purge(cfg)
 
@@ -96,22 +109,28 @@ def main():
 
     cfg = load_config()
 
-    if args.setup_schedule:
-        scheduler.enable(cfg.get("run_time", "09:00"))
-        print("Scheduled task created.")
-    elif args.remove_schedule:
-        scheduler.disable()
-        print("Scheduled task removed.")
-    elif args.purge:
-        state.init_db()
-        run_purge(cfg)
-    elif args.scan:
-        run_scan(cfg)
-    elif args.auto:
-        run_auto(cfg)
-    else:
-        import gui
-        gui.main()
+    try:
+        if args.setup_schedule:
+            scheduler.enable(cfg.get("run_time", "09:00"))
+            print("Scheduled task created.")
+        elif args.remove_schedule:
+            scheduler.disable()
+            print("Scheduled task removed.")
+        elif args.purge:
+            state.init_db()
+            run_purge(cfg)
+        elif args.scan:
+            run_scan(cfg)
+        elif args.auto:
+            run_auto(cfg)
+        else:
+            import gui
+            gui.main()
+    except Exception as e:
+        # Logged in addition to the normal traceback so an unattended
+        # scheduled run (nobody watching the console) still leaves a record.
+        app_log.error(f"Fatal error in main(): {e}\n{traceback.format_exc()}")
+        raise
 
 
 if __name__ == "__main__":

@@ -5,3 +5,6 @@ patch_cache/
 config.json
 .venv/
 venv/
+*.log
+.claude/
+.pytest_cache/
