@@ -51,7 +51,7 @@ FONT_UI = ("Segoe UI", 10)
 FONT_UI_BOLD = ("Segoe UI", 10, "bold")
 FONT_MONO = ("Consolas", 10)
 FONT_STAT_VALUE = ("Segoe UI", 16, "bold")
-FONT_STAT_LABEL = ("Segoe UI", 8, "bold")
+FONT_STAT_LABEL = ("Segoe UI", 9, "bold")
 
 DEFAULT_CONFIG = {
     "delay_days": 7,
@@ -60,6 +60,16 @@ DEFAULT_CONFIG = {
     "nvd_api_key": "",
     "retention_days": 180,
     "notify_new_cves": True,
+    # Defaults to False: when `winget download` can't be used, patch_store
+    # falls back to trusting winget's own manifest-reported hash instead
+    # of independently downloading and hashing a file. That's a real, but
+    # materially weaker, guarantee -- see patch_store._fallback_manifest_only.
+    # Leave this off unless you've accepted that tradeoff explicitly.
+    "allow_manifest_only_verification": False,
+    # Mirrors patch_store.verify_and_record's own default -- kept True so a
+    # fresh install (or a config.json predating this key) is at least as
+    # strict as patch_store's fallback, not silently weaker than it.
+    "require_valid_signature": True,
 }
 
 TABLE_COLUMNS = ("name", "installed", "available", "days_left", "cves", "verification", "status")
@@ -69,8 +79,8 @@ TABLE_HEADINGS = {
     "verification": "Verification", "status": "Status",
 }
 TABLE_WIDTHS = {
-    "name": 230, "installed": 110, "available": 110, "days_left": 175,
-    "cves": 190, "verification": 175, "status": 90,
+    "name": 230, "installed": 110, "available": 110, "days_left": 150,
+    "cves": 150, "verification": 175, "status": 90,
 }
 
 
@@ -94,7 +104,12 @@ class LocalPatchApp:
         self.root.minsize(920, 560)
         self.cfg = load_config()
         self._scan_active = False
+        self._deploy_active = False
         self._scan_cancel_event = None
+        # True once a scan has completed (successfully, not cancelled/errored)
+        # in this session -- lets the empty state distinguish "never scanned"
+        # from "just scanned, genuinely nothing pending" (see U8/_toggle_empty_state).
+        self._has_scanned = False
         # Soonest-eligible-first by default -- the most actionable rows surface at the top.
         self._sort_state = {"column": "days_left", "reverse": False}
 
@@ -104,6 +119,7 @@ class LocalPatchApp:
         self._build_dashboard()
         self._build_table()
         self._build_statusbar()
+        self._update_button_states()
 
         # Route every uncaught exception raised inside a Tk callback (button
         # clicks, etc.) into the Status Log instead of just stderr -- this
@@ -112,7 +128,31 @@ class LocalPatchApp:
         self.root.report_callback_exception = self._handle_tk_exception
 
         state.init_db()
+        self._reconcile_interrupted_deploys()
         self.refresh_table()
+
+    def _reconcile_interrupted_deploys(self):
+        """
+        If the app was closed (or crashed) while a deploy was mid-flight,
+        the affected row's deploy_status was left at 'deploying' forever --
+        nothing else ever transitions it out of that state, so the table
+        would show a permanently-stuck "In Progress". Sweep on startup,
+        before the first refresh_table(), so that never happens. There's no
+        WM_DELETE_WINDOW handler that could do this more gracefully on the
+        way out, since a hard crash wouldn't hit it anyway -- reconciling on
+        the way back in covers both cases.
+        """
+        with state.get_conn() as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM apps WHERE deploy_status='deploying'"
+            ).fetchone()[0]
+            if count:
+                conn.execute("UPDATE apps SET deploy_status='failed' WHERE deploy_status='deploying'")
+        if count:
+            app_log.warning(
+                f"Reset {count} app(s) stuck in 'deploying' status -- interrupted "
+                f"(app was closed or crashed) mid-deploy on a previous run."
+            )
 
     # ---------- Theming ----------
 
@@ -253,12 +293,19 @@ class LocalPatchApp:
 
         ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=SPACE["lg"])
 
-        ttk.Button(bar, text="Deploy Selected", cursor="hand2",
-                   command=self.on_deploy_selected).pack(side="left")
-        ttk.Button(bar, text="Deploy All Eligible", cursor="hand2",
-                   command=self.on_deploy_eligible).pack(side="left", padx=(SPACE["sm"], 0))
-        ttk.Button(bar, text="Deploy All Shown", cursor="hand2",
-                   command=self.on_deploy_all_shown).pack(side="left", padx=(SPACE["sm"], 0))
+        self.deploy_selected_button = ttk.Button(bar, text="Deploy Selected", cursor="hand2",
+                                                  command=self.on_deploy_selected)
+        self.deploy_selected_button.pack(side="left")
+        # "Deploy Ready Now" / "Deploy All (Skip Delay)" describe the actual
+        # behavior difference directly -- "Eligible" vs "Shown" required
+        # reading the code to tell apart. Method names (on_deploy_eligible /
+        # on_deploy_all_shown) are unchanged; only the button labels moved.
+        self.deploy_eligible_button = ttk.Button(bar, text="Deploy Ready Now", cursor="hand2",
+                                                  command=self.on_deploy_eligible)
+        self.deploy_eligible_button.pack(side="left", padx=(SPACE["sm"], 0))
+        self.deploy_all_shown_button = ttk.Button(bar, text="Deploy All (Skip Delay)", cursor="hand2",
+                                                   command=self.on_deploy_all_shown)
+        self.deploy_all_shown_button.pack(side="left", padx=(SPACE["sm"], 0))
 
         ttk.Button(bar, text="Settings", cursor="hand2", command=self.on_settings).pack(side="right")
 
@@ -336,7 +383,6 @@ class LocalPatchApp:
         def cves_of(app):
             return json.loads(app["cves"] or "[]")
 
-        pending = [a for a in apps if a["available_version"] and a["available_version"] != a["installed_version"]]
         severity_counts = {}
         critical_apps, high_apps = set(), set()
         for a in apps:
@@ -352,11 +398,18 @@ class LocalPatchApp:
         deploy_failed = sum(1 for a in apps if a["deploy_status"] == "failed")
 
         # --- Update Status ---
-        self._dashboard_row(self.status_card.body, len(pending), "Pending Updates")
-        self._dashboard_row(self.status_card.body, len(critical_apps), "Apps with Critical CVEs")
-        self._dashboard_row(self.status_card.body, len(high_apps), "Apps with High CVEs")
-        self._dashboard_row(self.status_card.body, verify_failed, "Verification Failures")
-        self._dashboard_row(self.status_card.body, deploy_failed, "Deploy Failures")
+        # Labels spell out "(all installed)" / "(all time)" explicitly --
+        # this card covers the WHOLE local inventory (see the docstring
+        # above), not just apps with a pending update like the header stat
+        # tiles do, so a near-identical unscoped label next to the header's
+        # "CRITICAL CVEs" / "NOT VERIFIED" would read as a bug (same-looking
+        # number, different scope, no visible reason why they'd differ).
+        # The header already owns the unambiguous "what's actionable right
+        # now" pending-updates count, so it isn't duplicated here.
+        self._dashboard_row(self.status_card.body, len(critical_apps), "Apps with Critical CVEs (all installed)")
+        self._dashboard_row(self.status_card.body, len(high_apps), "Apps with High CVEs (all installed)")
+        self._dashboard_row(self.status_card.body, verify_failed, "Verification Failures (all time)")
+        self._dashboard_row(self.status_card.body, deploy_failed, "Deploy Failures (all time)")
 
         # --- Vulnerability Severity ---
         sev_order = [("CRITICAL", "Critical"), ("HIGH", "High"), ("MEDIUM", "Medium"),
@@ -410,7 +463,14 @@ class LocalPatchApp:
 
         self.yscroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
         self.yscroll.grid(row=0, column=1, sticky="ns")
-        self.tree.configure(yscrollcommand=self.yscroll.set)
+        # Column widths above are trimmed so the common case fits without
+        # this at the default 1100px window width, but root.minsize(920,...)
+        # is narrower than TABLE_WIDTHS' sum -- without a horizontal
+        # scrollbar, Verification and Status (arguably the most important
+        # columns) could get scrolled off-screen with no way back to them.
+        self.xscroll = ttk.Scrollbar(table_frame, orient="horizontal", command=self.tree.xview)
+        self.xscroll.grid(row=1, column=0, sticky="ew")
+        self.tree.configure(yscrollcommand=self.yscroll.set, xscrollcommand=self.xscroll.set)
 
         # Dark-mode tints: subtle color washes rather than the light-mode
         # pastels a white-background app would use, so severity is still
@@ -420,22 +480,44 @@ class LocalPatchApp:
         # the severity tint on the rows that actually need attention.
         self.tree.tag_configure("critical", background="#3A1520")
         self.tree.tag_configure("high", background="#3A2A12")
+        # MEDIUM/LOW severity previously fell through to "clean" -- visually
+        # identical to an app with zero known CVEs, which reads as "no
+        # color = no risk" even though real (lower-severity) CVEs exist.
+        # #F8FAFC text on this background is ~14.3:1 -- comfortably above
+        # WCAG AA's 4.5:1 -- and it's visually distinct from critical's red
+        # tint and high's orange tint (dim olive/amber, not a top-tier alarm
+        # color).
+        self.tree.tag_configure("medium_low", background="#1E2A1A")
         self.tree.tag_configure("clean_even", background=COLORS["surface"])
         self.tree.tag_configure("clean_odd", background=COLORS["surface_alt"])
-        self.tree.tag_configure("verify_failed", foreground=COLORS["danger"], font=FONT_UI_BOLD)
+        # NOTE: this only ever affects text color, deliberately -- see the
+        # comment on _verification_label for why "failed" is signaled via a
+        # glyph in the cell value instead of (also) tinting the row red.
+        # #FCA5A5 (vs. the original #EF4444) measures ~7.3-8.8:1 against the
+        # backgrounds this can combine with (critical/high/clean row tints)
+        # -- #EF4444 measured only 3.67-4.27:1 against critical/high tints,
+        # under WCAG AA's 4.5:1 floor for normal text. See gui.py's fix
+        # notes / conversation history for the full relative-luminance math.
+        self.tree.tag_configure("verify_failed", foreground="#FCA5A5", font=FONT_UI_BOLD)
 
         # Empty state -- shares the same grid cell as the table and swaps
         # in via grid()/grid_remove() whenever there's nothing to show,
-        # whether that's "no scan run yet" or "everything is patched."
+        # whether that's "no scan run yet" or "everything is patched." The
+        # title/subtitle are kept as instance attrs (not fire-and-forget
+        # locals) so _toggle_empty_state can reword them based on whether a
+        # scan has actually run yet this session (see _has_scanned / U8).
         self.empty_state = ttk.Frame(table_frame)
         inner = ttk.Frame(self.empty_state)
         inner.place(relx=0.5, rely=0.42, anchor="center")
         tk.Label(inner, text="✓", font=("Segoe UI", 30, "bold"),
                  background=COLORS["bg"], foreground=COLORS["accent"]).pack()
-        tk.Label(inner, text="No pending updates", font=("Segoe UI", 13, "bold"),
-                 background=COLORS["bg"], foreground=COLORS["text"]).pack(pady=(SPACE["sm"], SPACE["xs"]))
-        tk.Label(inner, text="Run a scan to check installed software for updates and known CVEs.",
-                 font=FONT_UI, background=COLORS["bg"], foreground=COLORS["muted"]).pack()
+        self.empty_state_title = tk.Label(inner, text="No pending updates", font=("Segoe UI", 13, "bold"),
+                                           background=COLORS["bg"], foreground=COLORS["text"])
+        self.empty_state_title.pack(pady=(SPACE["sm"], SPACE["xs"]))
+        self.empty_state_subtitle = tk.Label(
+            inner, text="Run a scan to check installed software for updates and known CVEs.",
+            font=FONT_UI, background=COLORS["bg"], foreground=COLORS["muted"])
+        self.empty_state_subtitle.pack()
 
     def _build_statusbar(self):
         bar = ttk.Frame(self.root, style="StatusBar.TFrame")
@@ -460,7 +542,7 @@ class LocalPatchApp:
         self.status_detail_var = tk.StringVar(value="")
         self.status_detail_label = tk.Label(
             text_box, textvariable=self.status_detail_var, anchor="w",
-            background=COLORS["surface_alt"], foreground=COLORS["muted"], font=("Segoe UI", 8),
+            background=COLORS["surface_alt"], foreground=COLORS["muted"], font=("Segoe UI", 9),
         )
         self.status_detail_label.pack(anchor="w", fill="x")
 
@@ -516,13 +598,31 @@ class LocalPatchApp:
 
     # ---------- Actions ----------
 
+    def _set_busy(self):
+        """
+        The single source of truth for scan/deploy button enablement --
+        called any time self._scan_active or self._deploy_active changes.
+        Scanning and deploying are mutually exclusive (verify_and_record and
+        the scan's own state reads/writes weren't designed to interleave),
+        so either one being active disables Scan Now and all three Deploy
+        buttons. Stop Scan is the exception: it's only ever meaningful (and
+        enabled) while a scan specifically is running.
+        """
+        busy = self._scan_active or self._deploy_active
+        self.scan_button.state(["disabled"] if busy else ["!disabled"])
+        self.stop_scan_button.state(["!disabled"] if self._scan_active else ["disabled"])
+        for btn in (self.deploy_selected_button, self.deploy_eligible_button, self.deploy_all_shown_button):
+            btn.state(["disabled"] if busy else ["!disabled"])
+
+    # Kept as an alias so __init__'s call site reads naturally either way.
+    _update_button_states = _set_busy
+
     def on_scan(self):
-        if self._scan_active:
+        if self._scan_active or self._deploy_active:
             return
         self._scan_active = True
         self._scan_cancel_event = threading.Event()
-        self.scan_button.state(["disabled"])
-        self.stop_scan_button.state(["!disabled"])
+        self._set_busy()
 
         self.progress.configure(mode="indeterminate")
         self.progress.pack(side="right", padx=SPACE["md"], pady=SPACE["sm"])
@@ -539,14 +639,19 @@ class LocalPatchApp:
     def _reset_scan_buttons(self):
         self._scan_active = False
         self._scan_cancel_event = None
-        self.scan_button.state(["!disabled"])
-        self.stop_scan_button.state(["disabled"])
+        self._set_busy()
 
     def _scan_worker(self, cancel_event):
         cancelled = False
         checked = 0
         total = 0
         try:
+            # Snapshot once per scan, not read fresh from self.cfg every
+            # iteration -- otherwise a Settings change (NVD key, notify
+            # toggle) made while a scan is mid-flight would invisibly apply
+            # different behavior to apps checked later in the SAME scan
+            # than to the ones already checked.
+            cfg_snapshot = dict(self.cfg)
             installed = {a["Id"]: a for a in scanner.scan_installed()}
             upgrades = {a["Id"]: a for a in scanner.scan_upgrades()}
             # Snapshot pre-scan CVE state once, up front -- diffed per-app
@@ -554,7 +659,7 @@ class LocalPatchApp:
             # not the same known one every scan.
             prev_apps_by_id = {a["package_id"]: a for a in state.get_all_apps()}
 
-            matcher = cve_matcher.CveMatcher(api_key=self.cfg.get("nvd_api_key") or None)
+            matcher = cve_matcher.CveMatcher(api_key=cfg_snapshot.get("nvd_api_key") or None)
             total = len(installed)
             # Up to two throttled NVD requests per app (CPE lookup + CVE
             # lookup) -- a conservative upper-bound estimate before any
@@ -574,14 +679,25 @@ class LocalPatchApp:
                     break
 
                 available = upgrades.get(pkg_id, {}).get("Available")
-                release_date = scanner.get_release_date(pkg_id, available) if available else None
+                if available:
+                    # get_release_date shells out (~0.66s) -- only worth
+                    # paying for when the available version actually changed
+                    # since the last scan; a release date never changes for
+                    # a version we've already looked up.
+                    prev = prev_apps_by_id.get(pkg_id) or {}
+                    if prev.get("available_version") == available and prev.get("release_date"):
+                        release_date = prev["release_date"]
+                    else:
+                        release_date = scanner.get_release_date(pkg_id, available)
+                else:
+                    release_date = None
                 state.upsert_app(
                     package_id=pkg_id, name=app["Name"], source=app.get("Source", ""),
                     installed_version=app["Version"], available_version=available,
                     release_date=release_date,
                 )
                 cves = matcher.lookup(app["Name"], app["Version"])
-                if self.cfg.get("notify_new_cves", True):
+                if cfg_snapshot.get("notify_new_cves", True):
                     prev_cves = json.loads((prev_apps_by_id.get(pkg_id) or {}).get("cves") or "[]")
                     new_cves = notifier.diff_new_cves(prev_cves, cves)
                     if new_cves:
@@ -604,6 +720,7 @@ class LocalPatchApp:
                     f"Scan stopped. {checked}/{total} apps checked before stopping.", "info"))
             else:
                 app_log.info(f"Scan complete: {len(installed)} apps checked, {len(upgrades)} updates found.")
+                self._has_scanned = True
                 self.root.after(0, lambda: self._finish_progress(
                     f"Scan complete. {len(installed)} apps checked, {len(upgrades)} updates found.", "success"))
         except Exception as e:
@@ -614,7 +731,11 @@ class LocalPatchApp:
         self.root.after(0, self.refresh_table)
 
     def on_deploy_selected(self):
-        self._deploy_many(self.tree.selection())
+        selection = self.tree.selection()
+        if not selection:
+            messagebox.showinfo("LocalPatch", "Select at least one app first.")
+            return
+        self._deploy_many(selection)
 
     def on_deploy_eligible(self):
         eligible = state.get_eligible_for_autodeploy(self.cfg["delay_days"])
@@ -684,92 +805,146 @@ class LocalPatchApp:
         iids = list(iids)
         if not iids:
             return
+        if self._scan_active or self._deploy_active:
+            # Buttons are disabled while busy (see _set_busy), so this is a
+            # defensive backstop, not the primary guard -- but it's cheap
+            # insurance against a second deploy sneaking in through a stale
+            # callback or a race between click and disable.
+            messagebox.showinfo("LocalPatch", "A scan or deployment is already in progress.")
+            return
         if not messagebox.askyesno("Confirm Deployment", f"Deploy {len(iids)} update(s) now?"):
             return
+        self._deploy_active = True
+        self._set_busy()
         self.root.after(0, lambda: self._start_deploy_progress(len(iids)))
         self._set_status(f"Deploying {len(iids)} update(s)...")
         threading.Thread(target=self._deploy_worker, args=(iids,), daemon=True).start()
 
     def _deploy_worker(self, package_ids):
-        apps_by_id = {a["package_id"]: a for a in state.get_all_apps()}
-        blocked = 0
-        failed = 0
-        deployed = 0
-        total = len(package_ids)
-        start = time.time()
-        started_at = time.strftime("%H:%M:%S", time.localtime(start))
+        try:
+            # Snapshot once per batch, not read fresh from self.cfg every
+            # iteration -- otherwise a Settings change made mid-batch (e.g.
+            # toggling require_valid_signature) would invisibly apply
+            # different verification rules to later apps in the SAME
+            # confirmed batch than it did to earlier ones.
+            cfg_snapshot = dict(self.cfg)
+            apps_by_id = {a["package_id"]: a for a in state.get_all_apps()}
+            blocked = 0
+            failed = 0
+            deployed = 0
+            total = len(package_ids)
+            start = time.time()
+            started_at = time.strftime("%H:%M:%S", time.localtime(start))
 
-        for i, pkg_id in enumerate(package_ids, start=1):
-            version = apps_by_id.get(pkg_id, {}).get("available_version", "unknown")
-            name = apps_by_id.get(pkg_id, {}).get("name", pkg_id)
+            for i, pkg_id in enumerate(package_ids, start=1):
+                version = apps_by_id.get(pkg_id, {}).get("available_version", "unknown")
+                name = apps_by_id.get(pkg_id, {}).get("name", pkg_id)
 
-            # "In Progress" in the Status column from the moment this app
-            # starts, not just once it's done -- and refresh right away so
-            # it's visible before the (potentially slow) verify/install work
-            # even begins.
-            state.mark_deploying(pkg_id)
-            self.root.after(0, lambda i=i, name=name, version=version:
-                             self._update_deploy_progress(i, total, name, version, "verifying",
-                                                           started_at, time.time() - start))
-            self.root.after(0, self.refresh_table)
-
-            try:
-                result = patch_store.verify_and_record(pkg_id, version, self.cfg)
-                # Verification column updates the instant the result is
-                # known, independent of whether the install step (next)
-                # even runs.
+                # "In Progress" in the Status column from the moment this app
+                # starts, not just once it's done -- and refresh right away so
+                # it's visible before the (potentially slow) verify/install work
+                # even begins.
+                state.mark_deploying(pkg_id)
+                self.root.after(0, lambda i=i, name=name, version=version:
+                                 self._update_deploy_progress(i, total, name, version, "verifying",
+                                                               started_at, time.time() - start))
                 self.root.after(0, self.refresh_table)
 
-                if not result.verified:
-                    state.mark_deployed(pkg_id, version, success=False)
-                    app_log.warning(f"Blocked deploy: {name} {version} -- {result.reason}")
-                    blocked += 1
+                try:
+                    result = patch_store.verify_and_record(pkg_id, version, cfg_snapshot)
+                    # Verification column updates the instant the result is
+                    # known, independent of whether the install step (next)
+                    # even runs.
                     self.root.after(0, self.refresh_table)
-                    continue
 
-                self.root.after(0, lambda i=i, name=name, version=version:
-                                 self._update_deploy_progress(i, total, name, version, "installing",
-                                                               started_at, time.time() - start))
+                    if not result.verified:
+                        state.mark_deployed(pkg_id, version, success=False)
+                        app_log.warning(f"Blocked deploy: {name} {version} -- {result.reason}")
+                        blocked += 1
+                        self.root.after(0, self.refresh_table)
+                        continue
 
-                success, log = deployer.deploy(pkg_id)
-                state.mark_deployed(pkg_id, version, success)
-                if success:
-                    app_log.info(f"Deployed: {name} {version}")
-                    deployed += 1
-                else:
-                    app_log.error(f"Deploy failed: {name} {version} -- winget output: {log.strip()[-1000:]}")
+                    self.root.after(0, lambda i=i, name=name, version=version:
+                                     self._update_deploy_progress(i, total, name, version, "installing",
+                                                                   started_at, time.time() - start))
+
+                    success, log = deployer.deploy(pkg_id, version)
+                    state.mark_deployed(pkg_id, version, success)
+                    if success:
+                        app_log.info(f"Deployed: {name} {version}")
+                        deployed += 1
+                    else:
+                        app_log.error(f"Deploy failed: {name} {version} -- winget output: {log.strip()[-1000:]}")
+                        failed += 1
+                except Exception as e:
+                    state.mark_deployed(pkg_id, version, success=False)
+                    app_log.error(f"Unexpected error deploying {name} {version}: {e}\n{traceback.format_exc()}")
                     failed += 1
-            except Exception as e:
-                state.mark_deployed(pkg_id, version, success=False)
-                app_log.error(f"Unexpected error deploying {name} {version}: {e}\n{traceback.format_exc()}")
-                failed += 1
 
+                self.root.after(0, self.refresh_table)
+
+            elapsed_total = self._format_duration(time.time() - start)
+            summary = f"Deployment finished. {deployed} deployed."
+            kind = "success"
+            extras = []
+            if blocked:
+                extras.append(f"{blocked} blocked by verification")
+            if failed:
+                extras.append(f"{failed} failed")
+                kind = "error"
+            if extras:
+                summary += " " + ", ".join(extras) + " — see View Logs > Status Log."
+            detail = f"{total} patch{'es' if total != 1 else ''} scanned  •  Started {started_at}  •  Elapsed {elapsed_total}"
+            self.root.after(0, lambda: self._finish_progress(summary, kind, detail))
+        finally:
+            # Covers success, the caught per-app exceptions above (which
+            # don't propagate), and any unexpected exception that somehow
+            # escapes the loop -- either way, Scan Now and the Deploy
+            # buttons must not stay disabled forever.
+            self._deploy_active = False
+            self.root.after(0, self._set_busy)
             self.root.after(0, self.refresh_table)
-
-        elapsed_total = self._format_duration(time.time() - start)
-        summary = f"Deployment finished. {deployed} deployed."
-        kind = "success"
-        extras = []
-        if blocked:
-            extras.append(f"{blocked} blocked by verification")
-        if failed:
-            extras.append(f"{failed} failed")
-            kind = "error"
-        if extras:
-            summary += " " + ", ".join(extras) + " — see View Logs > Status Log."
-        detail = f"{total} patch{'es' if total != 1 else ''} scanned  •  Started {started_at}  •  Elapsed {elapsed_total}"
-        self.root.after(0, lambda: self._finish_progress(summary, kind, detail))
-        self.root.after(0, self.refresh_table)
 
     def on_settings(self):
         win = tk.Toplevel(self.root)
         self._style_dialog(win)
         win.title("Settings")
-        win.geometry("440x580")
-        win.resizable(False, False)
+        win.geometry("460x620")
+        win.minsize(420, 320)
+        win.resizable(True, True)
 
-        container = ttk.Frame(win, padding=SPACE["lg"])
-        container.pack(fill="both", expand=True)
+        # Scrollable content: this dialog has grown a new LabelFrame/checkbox
+        # almost every round of fixes, and a fixed-height non-resizable
+        # window kept clipping content at the bottom (confirmed via a real
+        # screenshot -- the manifest-only checkbox's hint text was cut off).
+        # A Canvas+inner-Frame scroll region can't overflow again regardless
+        # of how many more settings get added later. Save stays outside the
+        # scroll area so it's always reachable without scrolling to it.
+        save_bar = ttk.Frame(win, padding=(SPACE["lg"], SPACE["sm"], SPACE["lg"], SPACE["lg"]))
+        save_bar.pack(side="bottom", fill="x")
+
+        vscroll = ttk.Scrollbar(win, orient="vertical")
+        vscroll.pack(side="right", fill="y")
+
+        canvas = tk.Canvas(win, background=COLORS["bg"], highlightthickness=0,
+                            yscrollcommand=vscroll.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        vscroll.configure(command=canvas.yview)
+
+        container = ttk.Frame(canvas, padding=SPACE["lg"])
+        canvas_window = canvas.create_window((0, 0), window=container, anchor="nw")
+
+        def _on_container_configure(event):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+        container.bind("<Configure>", _on_container_configure)
+
+        def _on_canvas_configure(event):
+            canvas.itemconfig(canvas_window, width=event.width)
+        canvas.bind("<Configure>", _on_canvas_configure)
+
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        canvas.bind("<MouseWheel>", _on_mousewheel)
 
         schedule_frame = ttk.LabelFrame(container, text="Scan Schedule", padding=SPACE["md"])
         schedule_frame.pack(fill="x", pady=(0, SPACE["md"]))
@@ -792,7 +967,7 @@ class LocalPatchApp:
             text="Runs elevated so the daily run installs updates without a UAC prompt. "
                  "Toggling this asks for administrator approval once, here — manual "
                  "Deploy clicks in this window still prompt, as expected.",
-            font=("Segoe UI", 8), wraplength=340, justify="left",
+            font=("Segoe UI", 9), wraplength=340, justify="left",
             background=COLORS["bg"], foreground=COLORS["muted"],
         ).pack(anchor="w", pady=(SPACE["xs"], 0))
 
@@ -804,6 +979,31 @@ class LocalPatchApp:
         ttk.Entry(security_frame, textvariable=key_var, width=36, show="*").pack(
             anchor="w", pady=(SPACE["xs"], 0))
 
+        require_sig_var = tk.BooleanVar(value=self.cfg.get("require_valid_signature", True))
+        ttk.Checkbutton(security_frame, text="Require a valid Authenticode signature before deploying",
+                         variable=require_sig_var).pack(anchor="w", pady=(SPACE["md"], 0))
+        tk.Label(
+            security_frame,
+            text="Recommended. Disabling this allows verified-but-unsigned installers to "
+                 "deploy (advisory-only signature check).",
+            font=("Segoe UI", 9), wraplength=340, justify="left",
+            background=COLORS["bg"], foreground=COLORS["muted"],
+        ).pack(anchor="w", pady=(SPACE["xs"], 0))
+
+        manifest_only_var = tk.BooleanVar(value=self.cfg.get("allow_manifest_only_verification", False))
+        ttk.Checkbutton(security_frame,
+                         text="Allow manifest-only verification when winget download isn't available",
+                         variable=manifest_only_var).pack(anchor="w", pady=(SPACE["md"], 0))
+        tk.Label(
+            security_frame,
+            text="When `winget download` can't be used, falls back to trusting winget's own "
+                 "manifest-reported hash instead of independently downloading and hashing a "
+                 "file. That's a real, but materially weaker, guarantee. Leave this off unless "
+                 "you've accepted that tradeoff explicitly.",
+            font=("Segoe UI", 9), wraplength=340, justify="left",
+            background=COLORS["bg"], foreground=COLORS["muted"],
+        ).pack(anchor="w", pady=(SPACE["xs"], 0))
+
         notify_frame = ttk.LabelFrame(container, text="Notifications", padding=SPACE["md"])
         notify_frame.pack(fill="x", pady=(0, SPACE["md"]))
 
@@ -814,7 +1014,7 @@ class LocalPatchApp:
             notify_frame,
             text="Windows toast notification, informative only (no click-to-open -- "
                  "that needs a packaged app, which this isn't).",
-            font=("Segoe UI", 8), wraplength=340, justify="left",
+            font=("Segoe UI", 9), wraplength=340, justify="left",
             background=COLORS["bg"], foreground=COLORS["muted"],
         ).pack(anchor="w", pady=(SPACE["xs"], 0))
 
@@ -846,6 +1046,8 @@ class LocalPatchApp:
             self.cfg["run_time"] = time_var.get()
             self.cfg["auto_run_enabled"] = auto_var.get()
             self.cfg["nvd_api_key"] = key_var.get()
+            self.cfg["require_valid_signature"] = require_sig_var.get()
+            self.cfg["allow_manifest_only_verification"] = manifest_only_var.get()
             self.cfg["notify_new_cves"] = notify_var.get()
             self.cfg["retention_days"] = retention_var.get()
             save_config(self.cfg)
@@ -860,8 +1062,8 @@ class LocalPatchApp:
             win.destroy()
             self.refresh_table()
 
-        ttk.Button(container, text="Save", style="Accent.TButton", cursor="hand2",
-                   command=save_and_close).pack(pady=(SPACE["xs"], 0))
+        ttk.Button(save_bar, text="Save", style="Accent.TButton", cursor="hand2",
+                   command=save_and_close).pack()
 
     def on_view_verification_log(self):
         selection = self.tree.selection()
@@ -961,7 +1163,7 @@ class LocalPatchApp:
         btn_bar.grid(row=1, column=0, sticky="ew")
         ttk.Button(btn_bar, text="Refresh", cursor="hand2", command=refresh).pack(side="left")
         tk.Label(btn_bar, text=f"Log file: {app_log.LOG_PATH}", background=COLORS["bg"],
-                 foreground=COLORS["muted"], font=("Segoe UI", 8)).pack(side="right")
+                 foreground=COLORS["muted"], font=("Segoe UI", 9)).pack(side="right")
 
         refresh()
 
@@ -973,10 +1175,26 @@ class LocalPatchApp:
         if entry is None:
             return "Not checked yet", False
         if entry["verified"]:
+            # manifest-only passes never downloaded or hashed a file
+            # themselves (see patch_store._fallback_manifest_only) --
+            # a materially weaker guarantee than a full verification, so
+            # it must never be shown as a plain, indistinguishable
+            # "Verified" here.
+            if entry["verification_mode"] == "manifest-only":
+                return "Verified (manifest only)", False
             return "Verified", False
+        # ttk.Treeview tags apply per-row, not per-cell -- there's no way to
+        # color just the Verification column red without also tinting every
+        # other column (which then fuses with severity tinting on a
+        # critical/high row that ALSO failed verification, reading as
+        # "everything is red" with no distinguishable signal). So the
+        # failure signal lives in the cell text itself via this glyph, and
+        # the row-level "verify_failed" tag only lightens the text color
+        # (see its tag_configure call in _build_table) rather than
+        # overriding it to a bg-contrast-failing red.
         if not entry["hash_match"]:
-            return "Failed — hash mismatch", True
-        return "Failed — unsigned", True
+            return "⚠ Failed — hash mismatch", True
+        return "⚠ Failed — unsigned", True
 
     _STATUS_LABELS = {
         "idle": "-",
@@ -1018,11 +1236,24 @@ class LocalPatchApp:
         if is_empty:
             self.tree.grid_remove()
             self.yscroll.grid_remove()
+            self.xscroll.grid_remove()
+            if self._has_scanned:
+                # A scan JUST ran and correctly found nothing pending --
+                # telling the user to "run a scan" right after they did one
+                # is actively confusing, so this is worded as a result
+                # rather than an instruction.
+                self.empty_state_title.configure(text="Everything is up to date")
+                self.empty_state_subtitle.configure(text="No pending updates as of your last scan.")
+            else:
+                self.empty_state_title.configure(text="No pending updates")
+                self.empty_state_subtitle.configure(
+                    text="Run a scan to check installed software for updates and known CVEs.")
             self.empty_state.grid(row=0, column=0, columnspan=2, sticky="nsew")
         else:
             self.empty_state.grid_remove()
             self.tree.grid(row=0, column=0, sticky="nsew")
             self.yscroll.grid(row=0, column=1, sticky="ns")
+            self.xscroll.grid(row=1, column=0, sticky="ew")
 
     def refresh_table(self):
         # Called repeatedly during a live scan (once per app), not just
@@ -1043,7 +1274,15 @@ class LocalPatchApp:
                 continue  # only show apps with a pending update
 
             cves = json.loads(app["cves"] or "[]")
-            cve_text = ", ".join(c["id"] for c in cves) if cves else "-"
+            if not cves:
+                cve_text = "-"
+            elif len(cves) > 3:
+                # Full list is one click away via the row itself / dashboard
+                # risk card -- this just needs to signal "there's more" so a
+                # truncated list doesn't read as the complete picture.
+                cve_text = ", ".join(c["id"] for c in cves[:3]) + f", +{len(cves) - 3} more"
+            else:
+                cve_text = ", ".join(c["id"] for c in cves)
             severities = [c["severity"] for c in cves]
             sev_tag = "clean"
             if "CRITICAL" in severities:
@@ -1051,6 +1290,12 @@ class LocalPatchApp:
                 critical_count += 1
             elif "HIGH" in severities:
                 sev_tag = "high"
+            elif "MEDIUM" in severities or "LOW" in severities:
+                # Previously fell through to "clean" -- visually identical
+                # to an app with zero known CVEs, i.e. "no color = no risk"
+                # even when real (lower-severity) CVEs exist. See U5 in the
+                # UI review / tag_configure("medium_low", ...) in _build_table.
+                sev_tag = "medium_low"
 
             entry = self._verification_cache.get((app["package_id"], app["available_version"]))
             verification_label, verify_failed = self._verification_label(entry)
