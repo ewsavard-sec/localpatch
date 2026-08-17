@@ -167,6 +167,39 @@ def test_upsert_app_updates_release_date_when_version_changes(isolated_env):
     assert row["release_date"] == _date_only(1)
 
 
+def test_upsert_app_survives_concurrent_insert_race(isolated_env):
+    """
+    Reproduction of a real crash: a manual GUI scan and a diagnostic CLI
+    scan ran against the same machine's inventory at the same time. Both
+    processes' upsert_app() calls SELECT'd "no row yet" for a package
+    before either had inserted it, then both attempted an INSERT --
+    SQLite's UNIQUE constraint let exactly one through and raised
+    IntegrityError in the other, which used to be uncaught and crashed
+    the whole scan partway through (confirmed against a real 196-app
+    inventory, failing at app #180).
+
+    Simulated here by inserting the "winning" row directly, bypassing
+    upsert_app entirely, immediately before the "losing" call -- so
+    upsert_app's own SELECT still sees no row, forcing it down the INSERT
+    path and into the real race condition.
+    """
+    with state.get_conn() as conn:
+        conn.execute(
+            """INSERT INTO apps
+               (package_id, name, source, installed_version, available_version,
+                first_seen_available, release_date, last_scanned)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            ("pkg.race", "Pkg Race", "winget", "1.0", "2.0", "2026-01-01", None, "2026-01-01T00:00:00"),
+        )
+
+    # Must not raise -- the loser recovers by falling through to UPDATE.
+    state.upsert_app("pkg.race", "Pkg Race", "winget", "1.0", "2.0", release_date=_date_only(5))
+
+    rows = state.get_all_apps()
+    assert len(rows) == 1  # no duplicate row created
+    assert rows[0]["release_date"] == _date_only(5)
+
+
 # ---------- C2: reconcile_stuck_deploys ----------
 
 def test_reconcile_stuck_deploys_resets_deploying_to_failed(isolated_env):

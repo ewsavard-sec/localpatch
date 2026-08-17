@@ -172,36 +172,54 @@ def upsert_app(package_id, name, source, installed_version, available_version, r
         ).fetchone()
 
         if row is None:
+            # Two processes can legitimately race here -- e.g. a manual GUI
+            # scan running at the same time as the scheduled --auto task, or
+            # a diagnostic CLI scan run alongside a live GUI session. Both
+            # see "no row" from the SELECT above, both attempt an INSERT;
+            # SQLite's UNIQUE constraint lets exactly one through. CONFIRMED
+            # via a real concurrent GUI + CLI scan against the same machine's
+            # full app inventory: the loser previously crashed the whole
+            # scan with an uncaught IntegrityError. Since losing the race
+            # just means another process already created this exact row, the
+            # correct recovery is to fall through to the same UPDATE path
+            # used for the "row already existed" case.
             first_seen = now if available_version else None
-            conn.execute(
-                """INSERT INTO apps
-                   (package_id, name, source, installed_version, available_version,
-                    first_seen_available, release_date, last_scanned)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (package_id, name, source, installed_version, available_version,
-                 first_seen, release_date, now),
-            )
+            try:
+                conn.execute(
+                    """INSERT INTO apps
+                       (package_id, name, source, installed_version, available_version,
+                        first_seen_available, release_date, last_scanned)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (package_id, name, source, installed_version, available_version,
+                     first_seen, release_date, now),
+                )
+                return
+            except sqlite3.IntegrityError:
+                row = conn.execute(
+                    "SELECT available_version, first_seen_available, release_date FROM apps WHERE package_id = ?",
+                    (package_id,),
+                ).fetchone()
+
+        prev_available, prev_first_seen, prev_release_date = (
+            row["available_version"], row["first_seen_available"], row["release_date"],
+        )
+        version_changed = bool(available_version) and available_version != prev_available
+        if version_changed:
+            first_seen = now  # new version released — restart the burn-in clock
         else:
-            prev_available, prev_first_seen, prev_release_date = (
-                row["available_version"], row["first_seen_available"], row["release_date"],
-            )
-            version_changed = bool(available_version) and available_version != prev_available
-            if version_changed:
-                first_seen = now  # new version released — restart the burn-in clock
-            else:
-                first_seen = prev_first_seen
+            first_seen = prev_first_seen
 
-            if release_date is None and not version_changed and prev_release_date:
-                # Transient lookup failure on an otherwise-unchanged version:
-                # keep the known-good anchor instead of wiping it to NULL.
-                release_date = prev_release_date
+        if release_date is None and not version_changed and prev_release_date:
+            # Transient lookup failure on an otherwise-unchanged version:
+            # keep the known-good anchor instead of wiping it to NULL.
+            release_date = prev_release_date
 
-            conn.execute(
-                """UPDATE apps SET name=?, source=?, installed_version=?, available_version=?,
-                   first_seen_available=?, release_date=?, last_scanned=? WHERE package_id=?""",
-                (name, source, installed_version, available_version,
-                 first_seen, release_date, now, package_id),
-            )
+        conn.execute(
+            """UPDATE apps SET name=?, source=?, installed_version=?, available_version=?,
+               first_seen_available=?, release_date=?, last_scanned=? WHERE package_id=?""",
+            (name, source, installed_version, available_version,
+             first_seen, release_date, now, package_id),
+        )
 
 
 def set_cves(package_id, cve_list):
