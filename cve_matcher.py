@@ -27,7 +27,14 @@ NVD_CVE_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 
 class CveMatcher:
     def __init__(self, api_key=None, min_request_interval=None):
-        self.api_key = api_key
+        # Stray leading/trailing whitespace (easy to introduce via copy-paste,
+        # and invisible in the Settings dialog since that field is masked)
+        # makes requests.get() raise InvalidHeader on every call -- silently
+        # caught below, so every lookup would fail with zero CVEs ever found
+        # and no error surfaced anywhere. Strip defensively here so any
+        # caller gets a working key regardless of where it was loaded from.
+        api_key = api_key.strip() if api_key else None
+        self.api_key = api_key or None
         # Without a key: 5 requests / 30s -> stay under that.
         # With a key: 50 requests / 30s.
         self.min_interval = min_request_interval or (0.7 if api_key else 6.5)

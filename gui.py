@@ -1045,7 +1045,7 @@ class LocalPatchApp:
             self.cfg["delay_days"] = delay_var.get()
             self.cfg["run_time"] = time_var.get()
             self.cfg["auto_run_enabled"] = auto_var.get()
-            self.cfg["nvd_api_key"] = key_var.get()
+            self.cfg["nvd_api_key"] = key_var.get().strip()
             self.cfg["require_valid_signature"] = require_sig_var.get()
             self.cfg["allow_manifest_only_verification"] = manifest_only_var.get()
             self.cfg["notify_new_cves"] = notify_var.get()

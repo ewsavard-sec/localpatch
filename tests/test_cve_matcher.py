@@ -133,3 +133,22 @@ def test_find_cpe_network_failure_is_not_cached(isolated_env, monkeypatch):
     second = matcher._find_cpe("FlakyPackage")
     assert second is None
     assert len(calls) == 2
+
+
+def test_api_key_whitespace_is_stripped(isolated_env, monkeypatch):
+    """
+    A key with stray leading/trailing whitespace (easy to introduce via
+    copy-paste, and invisible in the Settings dialog since that field is
+    masked) previously made requests.get() raise InvalidHeader on every
+    call -- silently swallowed by the broad except in _find_cpe/lookup,
+    so every scan found zero CVEs with no error surfaced anywhere.
+    """
+    matcher = cve_matcher.CveMatcher(api_key=" abc123 \n")
+    assert matcher.api_key == "abc123"
+    assert matcher._headers() == {"apiKey": "abc123"}
+
+
+def test_blank_api_key_normalizes_to_none(isolated_env):
+    matcher = cve_matcher.CveMatcher(api_key="   ")
+    assert matcher.api_key is None
+    assert matcher._headers() == {}
